@@ -11,7 +11,7 @@ import { runModelPlugin } from "./model-plugin";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
-type VideoResponse = { id: string; status?: string; error?: { message?: string }; url?: string; result_url?: string; video_url?: string; content?: { video_url?: string; url?: string } | null };
+type VideoResponse = { id: string; status?: string; message?: string; error?: { message?: string }; url?: string; result_url?: string; video_url?: string; content?: { video_url?: string; url?: string } | null; output?: { video_url?: string; url?: string } | null };
 type ApiVideoResponse = VideoResponse | { code?: number | string; data?: VideoResponse | null; msg?: string; message?: string; error?: { message?: string } };
 type ApiEnvelope<T> = T | { code?: number | string; data?: T | null; msg?: string; message?: string; error?: { message?: string } };
 type RequestOptions = { signal?: AbortSignal };
@@ -19,7 +19,7 @@ type VideoMediaOptions = RequestOptions & { videos?: ReferenceVideo[]; audios?: 
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
-export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "plugin"; model: string };
+export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "plugin" | "ark"; model: string };
 type GeminiInlineData = { bytesBase64Encoded: string; mimeType: string };
 type GeminiVideoOperation = {
     name?: string;
@@ -76,6 +76,9 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
     if (script) return createPluginVideoTask(requestConfig, selectedModel, script, prompt, references, options);
     assertVideoConfig(requestConfig, requestConfig.model);
     if (requestConfig.apiFormat === "gemini") return createGeminiVideoTask(requestConfig, selectedModel, prompt, references, options);
+    // 火山方舟 / Ark 协议自带实现：content[] + /api/v3/contents/generations/tasks，
+    // 不挂「调用脚本」也能用。脚本优先级仍在最前面，用户可随时覆盖。
+    if (requestConfig.apiFormat === "ark") return createArkVideoTask(requestConfig, selectedModel, prompt, references, options);
     return createOpenAIVideoTask(requestConfig, selectedModel, prompt, references, options);
 }
 
@@ -87,6 +90,7 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
     const requestConfig = resolveModelRequestConfig(config, task.model);
     assertVideoConfig(requestConfig, requestConfig.model);
     if (task.provider === "gemini") return pollGeminiVideoTask(requestConfig, task, options);
+    if (task.provider === "ark") return pollArkVideoTask(requestConfig, task, options);
     return pollOpenAIVideoTask(requestConfig, task, options);
 }
 
@@ -144,6 +148,72 @@ export async function storeGeneratedVideo(result: VideoGenerationResult): Promis
         }
     }
     throw new Error(apiText("noPlayableVideo"));
+}
+
+/**
+ * 火山方舟 / Ark 协议（apigo 等兼容网关）的原生实现：
+ *   POST {base}/api/v3/contents/generations/tasks        -> { id }
+ *   GET  {base}/api/v3/contents/generations/tasks/{id}   -> { status, content: { video_url } }
+ * 与 OpenAI 的 multipart /v1/videos 是两条完全不同的路由，
+ * dreamina-seedance-* 只注册在方舟端点，走 /v1/videos 会报 does not support this endpoint。
+ */
+function arkVideoBaseUrl(config: Pick<AiConfig, "baseUrl">) {
+    let base = config.baseUrl.trim().replace(/\/+$/, "");
+    // 裸域名 / 带 /v1 的旧填法统一收敛到 /api/v3，避免 buildApiUrl 自动补 /v1 造成 404
+    if (!/\/api\/v3$/i.test(base)) base = `${base.replace(/\/(v1|api)$/i, "")}/api/v3`;
+    return base;
+}
+
+function arkVideoTaskUrl(config: Pick<AiConfig, "baseUrl">, path: string) {
+    return withLocalProxy(`${arkVideoBaseUrl(config)}${path}`);
+}
+
+async function createArkVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
+    const images = await Promise.all(references.map((image) => imageToDataUrl(image)));
+    // 方舟只认 content[]，不认官方 input_reference[]；参考图为 dataURL / asset:// URL 均可放入
+    const content: Array<Record<string, unknown>> = [{ type: "text", text: prompt }];
+    images.forEach((url) => content.push({ type: "image_url", image_url: { url } }));
+    const body = {
+        model: modelOptionName(model),
+        content,
+        seconds: Number(normalizeVideoSeconds(config.videoSeconds)) || 6,
+        size: normalizeVideoSize(config.size, config.vquality) || "1280x720",
+        resolution_name: normalizeVideoResolution(config.vquality),
+        // apigo 网关开启音频时易触发版权限制，这里固定关闭；需要音频请用「调用脚本」覆盖
+        generate_audio: false,
+        watermark: boolConfig(config.videoWatermark, false),
+    };
+    try {
+        const created = unwrapEnvelope<VideoResponse>((await axios.post<ApiEnvelope<VideoResponse>>(
+            arkVideoTaskUrl(config, "/contents/generations/tasks"),
+            body,
+            { headers: aiHeaders(config, "application/json"), signal: options?.signal },
+        )).data, apiText("noVideoTask"));
+        if (!created.id) throw new Error(apiText("noVideoTaskId"));
+        return { id: created.id, provider: "ark", model };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoTaskCreateFailed")));
+    }
+}
+
+async function pollArkVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+    try {
+        const state = unwrapEnvelope<VideoResponse>((await axios.get<ApiEnvelope<VideoResponse>>(
+            arkVideoTaskUrl(config, `/contents/generations/tasks/${encodeURIComponent(task.id)}`),
+            { headers: aiHeaders(config), signal: options?.signal },
+        )).data, apiText("noVideoTask"));
+        const url = videoResultUrl(state);
+        if (url) return { status: "completed", result: await videoResultFromUrl(url, options) };
+        const status = (state.status || "").toLowerCase();
+        if (["failed", "cancelled", "canceled", "expired", "error"].includes(status)) {
+            const message = readApiErrorMessage(state.error?.message) || readApiErrorMessage(state.message);
+            return { status: "failed", error: message || apiText("videoGenerationFailed") };
+        }
+        if (["succeeded", "completed", "success"].includes(status)) return { status: "failed", error: apiText("noPlayableVideo") };
+        return { status: "pending" };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoTaskQueryFailed")));
+    }
 }
 
 async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
@@ -357,7 +427,7 @@ function unwrapEnvelope<T>(payload: ApiEnvelope<T>, emptyMessage: string): T {
 }
 
 function videoResultUrl(payload: VideoResponse) {
-    return [payload.video_url, payload.result_url, payload.url, payload.content?.video_url, payload.content?.url].find((url) => typeof url === "string" && (isPublicMediaUrl(url) || /\.mp4(\?|#|$)/i.test(url)));
+    return [payload.video_url, payload.result_url, payload.url, payload.content?.video_url, payload.content?.url, payload.output?.video_url, payload.output?.url].find((url) => typeof url === "string" && (isPublicMediaUrl(url) || /\.mp4(\?|#|$)/i.test(url)));
 }
 
 function readApiErrorMessage(value: unknown): string {
