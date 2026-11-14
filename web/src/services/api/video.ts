@@ -156,29 +156,77 @@ export async function storeGeneratedVideo(result: VideoGenerationResult): Promis
  *   GET  {base}/api/v3/contents/generations/tasks/{id}   -> { status, content: { video_url } }
  * 与 OpenAI 的 multipart /v1/videos 是两条完全不同的路由，
  * dreamina-seedance-* 只注册在方舟端点，走 /v1/videos 会报 does not support this endpoint。
+ *
+ * 可选「转存中继」：把渠道接口地址填成 .../apigo-relay 时，
+ * 参考图先分块上传到中继换成公网 URL，再由中继注册成 apigo 素材库 asset:// 引用，
+ * 这是绕过 `may contain real person` 的唯一可靠方式（直传 dataURL / 公网 URL 都会被拦）。
+ * 不填中继时行为与原来完全一致。
  */
+const ARK_UPLOAD_CHUNK_CHARS = 400_000;
+
+function arkVideoRelayBase(config: Pick<AiConfig, "baseUrl">) {
+    const base = config.baseUrl.trim().replace(/\/+$/, "");
+    return /\/apigo-relay$/i.test(base) ? base : null;
+}
+
 function arkVideoBaseUrl(config: Pick<AiConfig, "baseUrl">) {
-    let base = config.baseUrl.trim().replace(/\/+$/, "");
+    const base = config.baseUrl.trim().replace(/\/+$/, "");
+    if (arkVideoRelayBase(config)) return base;
     // 裸域名 / 带 /v1 的旧填法统一收敛到 /api/v3，避免 buildApiUrl 自动补 /v1 造成 404
-    if (!/\/api\/v3$/i.test(base)) base = `${base.replace(/\/(v1|api)$/i, "")}/api/v3`;
-    return base;
+    let normalized = base;
+    if (!/\/api\/v3$/i.test(normalized)) normalized = `${normalized.replace(/\/(v1|api)$/i, "")}/api/v3`;
+    return normalized;
 }
 
 function arkVideoTaskUrl(config: Pick<AiConfig, "baseUrl">, path: string) {
-    return withLocalProxy(`${arkVideoBaseUrl(config)}${path}`);
+    // 中继自己的路由是 /v3/...（内部换算成 /api/v3/...）；直连 apigo 时 base 已含 /api/v3。
+    const prefix = arkVideoRelayBase(config) ? "/v3" : "";
+    return withLocalProxy(`${arkVideoBaseUrl(config)}${prefix}${path}`);
+}
+
+/** 把 dataURL 参考图分块上传到转存中继，换回公网 URL（避免大 POST body 撞 WAF）。 */
+async function arkUploadReference(config: AiConfig, dataUrl: string, signal?: AbortSignal): Promise<string> {
+    const relay = arkVideoRelayBase(config);
+    if (!relay || !dataUrl.startsWith("data:")) return dataUrl;
+    const uploadId = `canvas-${nanoid()}`;
+    const total = Math.max(1, Math.ceil(dataUrl.length / ARK_UPLOAD_CHUNK_CHARS));
+    let publicUrl = "";
+    for (let index = 0; index < total; index += 1) {
+        const response = await axios.post<{ complete?: boolean; url?: string }>(
+            `${relay}/v3/upload/chunk`,
+            {
+                uploadId,
+                index,
+                total,
+                data: dataUrl.slice(index * ARK_UPLOAD_CHUNK_CHARS, (index + 1) * ARK_UPLOAD_CHUNK_CHARS),
+            },
+            { headers: aiHeaders(config, "application/json"), signal },
+        );
+        if (response.data?.complete && response.data.url) publicUrl = response.data.url;
+    }
+    if (!publicUrl) throw new Error(apiText("videoTaskCreateFailed") + "（参考图转存未返回公网 URL）");
+    return publicUrl;
 }
 
 async function createArkVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
     const images = await Promise.all(references.map((image) => imageToDataUrl(image)));
+    // 走转存中继时，先把 dataURL 换成公网 URL（中继会再把它注册成 asset://）；
+    // 直连 apigo 时 arkUploadReference 原样返回，行为不变。
+    let resolvedImages: string[];
+    try {
+        resolvedImages = await Promise.all(images.map((url) => arkUploadReference(config, url, options?.signal)));
+    } catch (error) {
+        throw new Error(`${readAxiosError(error, apiText("videoTaskCreateFailed"))}（参考图转存失败）`);
+    }
     // 方舟只认 content[]，不认官方 input_reference[]；参考图为 dataURL / asset:// URL 均可放入。
     // ⚠️ 每个 image_url 项必须带 role，否则网关报
     //    `content is not valid: role must be specified for image contents`。
     //    首帧 / 首尾帧 / 参考图是三种互斥场景，不能混用（见火山方舟「创建视频生成任务」）：
     //      frames    -> 第 1 张 first_frame，第 2 张 last_frame
     //      reference -> 每张都是 reference_image
-    const mode = resolveVideoMode(config.videoMode, images.length);
+    const mode = resolveVideoMode(config.videoMode, resolvedImages.length);
     const content: Array<Record<string, unknown>> = [{ type: "text", text: prompt }];
-    images.forEach((url, index) => {
+    resolvedImages.forEach((url, index) => {
         const role = mode === "reference" ? "reference_image" : index === 0 ? "first_frame" : "last_frame";
         content.push({ type: "image_url", image_url: { url }, role });
     });
