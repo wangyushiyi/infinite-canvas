@@ -170,9 +170,18 @@ function arkVideoTaskUrl(config: Pick<AiConfig, "baseUrl">, path: string) {
 
 async function createArkVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
     const images = await Promise.all(references.map((image) => imageToDataUrl(image)));
-    // 方舟只认 content[]，不认官方 input_reference[]；参考图为 dataURL / asset:// URL 均可放入
+    // 方舟只认 content[]，不认官方 input_reference[]；参考图为 dataURL / asset:// URL 均可放入。
+    // ⚠️ 每个 image_url 项必须带 role，否则网关报
+    //    `content is not valid: role must be specified for image contents`。
+    //    首帧 / 首尾帧 / 参考图是三种互斥场景，不能混用（见火山方舟「创建视频生成任务」）：
+    //      frames    -> 第 1 张 first_frame，第 2 张 last_frame
+    //      reference -> 每张都是 reference_image
+    const mode = resolveVideoMode(config.videoMode, images.length);
     const content: Array<Record<string, unknown>> = [{ type: "text", text: prompt }];
-    images.forEach((url) => content.push({ type: "image_url", image_url: { url } }));
+    images.forEach((url, index) => {
+        const role = mode === "reference" ? "reference_image" : index === 0 ? "first_frame" : "last_frame";
+        content.push({ type: "image_url", image_url: { url }, role });
+    });
     const body = {
         model: modelOptionName(model),
         content,
