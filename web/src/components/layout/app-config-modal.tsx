@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { ModelPicker } from "@/components/model-picker";
-import { videoResolutionOptions } from "@/components/video-settings-panel";
+import { videoResolutionOptions, normalizeVideoModeValue } from "@/components/video-settings-panel";
 import { ChannelEditorDrawer } from "@/components/layout/channel-editor-drawer";
 import { ConfigLocalProxy } from "@/components/layout/config-local-proxy";
 import { ConfigPromptSources } from "@/components/layout/config-prompt-sources";
@@ -269,6 +269,18 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                         />
                                     </Form.Item>
                                 </div>
+                                <Form.Item label={t("config.preferences.defaultVideoMode")} extra={t("config.preferences.defaultVideoModeDescription")} className="mb-4">
+                                    <Radio.Group value={normalizeVideoModeValue(config.videoMode)} onChange={(event) => updateConfig("videoMode", event.target.value)} className="flex flex-col gap-2">
+                                        <Radio value="reference">
+                                            <span className="block text-sm font-medium">{t("settingsPanels.video.modes.reference")}</span>
+                                            <span className="mt-0.5 block text-xs opacity-60">{t("config.preferences.defaultVideoModeReferenceHint")}</span>
+                                        </Radio>
+                                        <Radio value="frames">
+                                            <span className="block text-sm font-medium">{t("settingsPanels.video.modes.frames")}</span>
+                                            <span className="mt-0.5 block text-xs opacity-60">{t("config.preferences.defaultVideoModeFramesHint")}</span>
+                                        </Radio>
+                                    </Radio.Group>
+                                </Form.Item>
                                 <Form.Item label={t("config.preferences.regenerateBehavior")} className="mb-4">
                                     <Radio.Group value={config.nodeRegenerateBehavior} onChange={(event) => updateConfig("nodeRegenerateBehavior", event.target.value)} className="flex flex-col gap-2">
                                         <Radio value="overwrite">

@@ -199,15 +199,15 @@ function getVideoConfig() {
             resolution: config.vquality || "720",
             generateAudio: config.videoGenerateAudio !== "false",
             watermark: config.videoWatermark === "true",
-            mode: config.videoMode === "reference" ? "reference" : "frames",
+            mode: config.videoMode === "frames" ? "frames" : "reference",
         },
         models: selectableModelsByCapability(config, "video").map((value) => ({ value, label: modelOptionLabel(config, value) })),
         sizeOptions: videoSizeOptions,
         secondsRange: videoSecondsRange,
         resolutionOptions: videoResolutionOptions,
         modeOptions: [
-            { value: "frames", label: i18n.t("settingsPanels.video.modes.frames") },
             { value: "reference", label: i18n.t("settingsPanels.video.modes.reference") },
+            { value: "frames", label: i18n.t("settingsPanels.video.modes.frames") },
         ],
     };
 }

@@ -449,9 +449,15 @@ function normalizeVideoSeconds(value: string) {
     return clampVideoSeconds(value);
 }
 
+/**
+ * 决定本次请求里参考图的身份。默认「全能参考」(reference)：
+ *   - 只有用户显式选了「首尾帧」(frames) 且图片不超过 2 张时才走首帧/尾帧；
+ *   - 超过 2 张图时首尾帧模式本身无意义，一律按参考图处理。
+ * 这个值同时影响 ark 的 role、OpenAI 的 first_frame/last_frame 字段、Gemini 的 referenceImages。
+ */
 function resolveVideoMode(mode: string | undefined, imageCount: number) {
-    if (mode === "reference" || imageCount > 2) return "reference";
-    return "frames";
+    if (mode === "frames" && imageCount <= 2) return "frames";
+    return "reference";
 }
 
 function normalizeVideoSize(value: string, resolution?: string) {

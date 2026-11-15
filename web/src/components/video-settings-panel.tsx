@@ -13,9 +13,10 @@ const resolutionOptions = [
     { value: "720", label: "720p" },
     { value: "1080", label: "1080p" },
 ];
+// 默认项是「全能参考」，放在左起第一位
 const videoModeOptions = [
-    { value: "frames", labelKey: "frames" },
     { value: "reference", labelKey: "reference" },
+    { value: "frames", labelKey: "frames" },
 ];
 
 export const videoResolutionOptions = resolutionOptions.map((item) => ({ value: item.value, label: item.label }));
@@ -124,7 +125,8 @@ export function videoModeLabel(value: string) {
 }
 
 export function normalizeVideoModeValue(value: string | undefined) {
-    return value === "reference" ? "reference" : "frames";
+    // 缺省 / 旧配置 / 未知值一律回落到默认「全能参考」
+    return value === "frames" ? "frames" : "reference";
 }
 
 export function normalizeVideoSizeValue(value: string, resolution = "720") {

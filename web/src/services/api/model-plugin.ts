@@ -443,7 +443,7 @@ return await generateImage({
  * @param {File[]} videos - reference videos; empty when none
  * @param {File[]} audios - reference audio; empty when none
  * @param {object} params
- * @param {string} params.mode - "frames" uses first/last frame fields; "reference" sends all images as references. More than 2 images become "reference".
+ * @param {string} params.mode - default is "reference" (all images act as references); "frames" uses first/last frame fields only when there are at most 2 images.
  * @param {string|number} params.seconds - duration
  * @param {string} params.size - output size, e.g. "1280x720"
  * @param {string} params.resolution - e.g. "720p"

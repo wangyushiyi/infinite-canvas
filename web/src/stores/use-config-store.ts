@@ -114,7 +114,9 @@ export const defaultConfig: AiConfig = {
     vquality: "720",
     videoGenerateAudio: "true",
     videoWatermark: "false",
-    videoMode: "frames",
+    // 默认「全能参考」：所有参考图都以 reference_image 身份参与生成，
+    // 而不是被当成首帧/尾帧。用户可在「生成偏好」或单个视频节点里改回「首尾帧」。
+    videoMode: "reference",
     systemPrompt: "",
     reasoningEffort: "auto",
     models: ["default::gpt-image-2", "default::grok-imagine-video", "default::gpt-5.5", "default::gpt-4o-mini-tts"],
@@ -280,7 +282,8 @@ export const useConfigStore = create<ConfigStore>()(
                         vquality: config.vquality || "720",
                         videoGenerateAudio: config.videoGenerateAudio || "true",
                         videoWatermark: config.videoWatermark || "false",
-                        videoMode: config.videoMode === "reference" ? "reference" : "frames",
+                        // 只有显式存过「首尾帧」才保留；缺省/未知值一律用新的默认「全能参考」
+                        videoMode: config.videoMode === "frames" ? "frames" : "reference",
                         canvasImageCount: config.canvasImageCount || "3",
                         proxyEnabled: Boolean(config.proxyEnabled),
                         proxyUrl: config.proxyUrl || DEFAULT_LOCAL_PROXY_URL,
