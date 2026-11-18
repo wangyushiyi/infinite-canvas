@@ -110,6 +110,16 @@ state_put($taskId, array_merge($rec, [
     'type' => 'output',
 ]));
 
+// 成片下载走**浏览器直连云机**，不过中继。
+// 原因（实测）：成片普遍 10~15MB，Hostinger 拉云机文件会超时（504）。
+// 而云机的 /view 带 Access-Control-Allow-Origin，浏览器直取没问题。
+$q = http_build_query([
+    'filename' => $filename,
+    'subfolder' => $subfolder,
+    'type' => 'output',
+]);
+$cloudUrl = COMFY_BASE . '/view?' . $q;
+
 send_json([
     'id' => $taskId,
     'object' => 'video',
@@ -117,4 +127,8 @@ send_json([
     'status' => 'completed',
     'filename' => $filename,
     'subfolder' => $subfolder,
+    // 画布优先取 url；url 是云机直链（浏览器可跨域取）
+    'url' => $cloudUrl,
+    'video_url' => $cloudUrl,
+    'result_url' => $cloudUrl,
 ]);

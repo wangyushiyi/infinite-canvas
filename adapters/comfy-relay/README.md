@@ -35,19 +35,48 @@
 
 ---
 
-## 路由
+## 上传流程：为什么文件不过中继
+
+实测（2026-11-18）：
+
+| 路径 | 结果 |
+|---|---|
+| Hostinger → 云机 `GET /system_stats` | 615ms 通，但 **8 次里 2 次整次超时**（跨境链路不稳） |
+| Hostinger → 云机 multipart 上传 16KB | 成功，服务端只花 0.7s |
+| Hostinger → 云机 multipart 上传 190KB | **超时**（curl 等 66s 无响应） |
+| 浏览器 → 云机 multipart 上传 190KB | **成功**（ComfyUI 带 `--enable-cors-header *`，预检和实际 POST 都回 `ACAO:*`） |
+| Hostinger → apigo | 稳定 0.9–2.7s，5/5 全通（说明是 AutoDL 公网入口对海外主机的链路问题） |
+
+**结论**：文件走「浏览器 → 云机」直传，中继只负责编排工作流 JSON（已验证 POST 通）。
+
+### 流程
+
+```
+1) 画布 POST /v1/uploads/issue   →  { upload_id, cloud_name, upload_url }
+2) 画布 POST upload_url（云机）   →  云机返回 cloud_name
+3) 画布 POST /v1/videos          →  带 upload_id + cloud_name
+4) 中继查账本拿 cloud_name，填进工作流
+```
+
+### 路由
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/comfy-relay/health` | 健康检查（不需要 key） |
+| GET | `/comfy-relay/diag/upstream` | 上游连通性诊断（延迟/版本） |
+| POST | `/comfy-relay/v1/uploads/issue` | 签发上传令牌 |
 | POST | `/comfy-relay/v1/videos` | 创建视频任务（multipart） |
 | GET | `/comfy-relay/v1/videos/{id}` | 查询任务状态 |
 | GET | `/comfy-relay/v1/videos/{id}/content` | 下载成片 |
 | POST | `/comfy-relay/v1/images/generations` | 文生图（JSON） |
 | POST | `/comfy-relay/v1/images/edits` | 参考图生图（multipart） |
+| GET | `/comfy-relay/v1/images/{id}` | 查询生图任务（返回 b64_json + dataURL） |
 
 所有响应（含 4xx/5xx）都带 `Access-Control-Allow-Origin: *`，
 **这是关键**——否则浏览器又会把状态码吃掉。
+
+> 生图是**异步**的：提交即返回 task id，画布用 `GET /v1/images/{id}` 轮询。
+> 原因：Hostinger 共享主机的 PHP 执行上限约 30s，同步等出图必超时。
 
 ---
 
@@ -120,13 +149,44 @@ python scripts/deploy_comfy_relay.py verify   # 验证
 
 ## 排障
 
+### ⚠️ 排障第一课：ComfyUI 的错误不在 /history 里
+
+`/history/{id}` 只返回 `status_str` 和 `messages`。**节点级校验错误（枚举非法、
+图片不存在、工作流缺节点）只写进云机的 comfyui 日志**：
+
+```bash
+ssh -p 28741 root@connect.bjb2.seetacloud.com
+grep -n 'Value not in list\|Invalid image file\|Failed to validate' \
+  /root/ComfyUI/user/comfyui_6006.log | tail -20
+```
+
+典型症状：**`status_str: success` 但 `outputs` 为空** —— 不是云机挂了，是校验失败。
+
+### 已踩过的坑（都有日志佐证）
+
 | 现象 | 真因 | 处置 |
 |---|---|---|
-| 画布显示「请求失败」（裸） | 画布没挂调用脚本，走原生 `/v1/videos`，ComfyUI 返 405 且无 CORS 头 | 本服务已解决：画布接口地址指向本服务 |
+| success 但 outputs 空 | `aspect_ratio` 枚举非法 | 用云机**实际**枚举（见下） |
+| /prompt 返 400 `Node '_api_config' has no class_type` | 工作流带元数据节点 | `comfy_strip_meta_nodes()` 自动剔除 |
+| 轮询恒返回「非法 task id」 | 路由没把 id 传给脚本 | index.php 注入 `$taskId` |
+| 错误信息只有 HTTP 400 没有原因 | 真实错误在顶层 `error.message` | 三处 fallback 提取 |
+| 画布显示裸「请求失败」 | 画布没挂脚本 → 走原生 `/v1/videos` → 405 且无 CORS 头 → 浏览器拦截 | 用本服务；或给云机 nginx 加 `always;` 的 CORS 头 |
 | 401 | `RELAY_KEY` 不一致 | 对齐 `config/config.php` 与画布渠道 |
 | 502 云机不可达 | AutoDL 实例关机/换机 | 改 `COMFY_BASE` |
 | 出片但音轨是念 prompt 的声音 | 画布没传 `videos`（原视频） | 画布里把原视频连进视频节点的参考 |
-| 每次出片都一样 | seed 命中缓存 | 服务端已用随机 seed；手改工作流时注意 |
+| 每次出片都一样 | seed 命中缓存 | 服务端已用随机 seed |
+| 上传超时 | Hostinger→云机大文件链路不稳 | 文件走浏览器直传（见上） |
+
+### 云机实测枚举（别凭印象写）
+
+`ResolutionSelector.aspect_ratio`：
+
+```
+1:1 (Square) | 2:3 (Portrait Photo) | 3:2 (Photo) | 3:4 (Portrait Standard)
+4:3 (Standard) | 9:16 (Portrait Widescreen) | 16:9 (Widescreen) | 21:9 (Ultrawide)
+```
+
+> 拿当前枚举：`curl -s https://<云机>/object_info/ResolutionSelector | jq .ResolutionSelector.input.required.aspect_ratio`
 
 ---
 
@@ -134,12 +194,29 @@ python scripts/deploy_comfy_relay.py verify   # 验证
 
 ```
 index.php                    路由 + CORS
-config/config.php            配置（三段式密钥）
+config/config.php            配置（三段式密钥，**不入 Git**）
+config/config.example.php    配置模板
 config/comfy_core.php        ComfyUI 客户端 / H3 提示词编排 / 工作流改写 / 任务账本
+scripts/upload_issue.php     上传令牌 + 参考图收集（直传优先）
 scripts/create_video.php     POST /v1/videos
 scripts/poll_video.php       GET  /v1/videos/{id}
 scripts/fetch_content.php    GET  /v1/videos/{id}/content
 scripts/create_image.php     POST /v1/images/generations|edits
-scripts/deploy_comfy_relay.py  部署脚本
+scripts/poll_image.php       GET  /v1/images/{id}
+scripts/deploy_comfy_relay.py  部署脚本（probe / lint / upload / verify）
+scripts/test_relay_logic.py  离线自检 191 项
 workflows/*.json             工作流模板
 ```
+
+## 离线自检
+
+```bash
+python scripts/test_relay_logic.py     # 191 项，0 失败
+```
+
+本机没有 `php.exe`，所以用 Python 等价复刻 PHP 逻辑来验证
+（工作流改写 / 槽位真序 / 音轨直连 / 提示词编排 / 枚举合法性 /
+PHP 语法平衡 / 路由参数传递 / 部署清单完整性）。
+**改 PHP 时记得同步改这个脚本并重跑。**
+服务器端还有一道真语法检查：`deploy_comfy_relay.py lint`
+（上传一次性脚本到服务器用 `token_get_all(..., TOKEN_PARSE)` 解析，读完自删）。
