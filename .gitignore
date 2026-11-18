@@ -15,3 +15,6 @@ web/public/plugins
 plugins/canvas/*/dist
 plugins/canvas/*/node_modules
 web/public/plugins
+# comfy-relay：部署前的本地备份 + 含密钥的真实配置（绝不入 Git）
+adapters/comfy-relay/**/*.backup-before-*
+adapters/comfy-relay/config/config.php

@@ -11,6 +11,7 @@
 """
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -28,9 +29,121 @@ SLOT_SEED = "129"
 SLOT_STEPS = "184"
 SLOT_SAVE = "180"
 SLOT_H3 = "275"
+COMFY_PLACEHOLDER_VIDEO = "zealman-blank-video.mp4"  # 无原视频时的占位文件（与 PHP 同步）
+COMFY_PLACEHOLDER_IMAGE = "zealman-blank-image.png"  # 无参考图时的占位文件（与 PHP 同步）
 
 PASS = 0
 FAIL = 0
+
+
+def test_new_modes(profiles):
+    print("\n[新] 三种新形态：fl2va / aggregate")
+    pj = '{"summary":"x"}'
+
+    # ---- fl2va（U02/U03）----
+    fl2va_models = [n for n, p in profiles.items() if p.get("mode") == "fl2va"]
+    check("存在 fl2va 形态档案", len(fl2va_models) >= 2, str(fl2va_models))
+    for name in fl2va_models:
+        p = profiles[name]
+        slots = p.get("slots") or {}
+        wf = load_wf(p["file"])
+        # fl2va 的 prompt 是自然语言（由 create_video.php 用 h3_build_fl2va_prompt 生成），
+        # 这里复刻同样的入参，而不是塞七字段 JSON。
+        pr = dict(p)
+        pr["prompt_text"] = build_fl2va_prompt("人物在书房里喝水", 7.0, 2)
+        out = patch_dispatch(wf, ["a.png", "b.png"], "", pj, 7.0, 999, 12, "9:16", 0.5, pr)
+
+        # prompt 必须是内联字符串（不是 JSON 塞进 JSON 位）
+        prompt = out[slots["h3"]]["inputs"].get("prompt", "")
+        check("%s fl2va prompt 是自然语言含 Timeline" % name,
+              "Timeline:" in prompt and not prompt.strip().startswith("{"))
+        # 时长写进 PrimitiveFloat
+        check("%s fl2va 时长已写入" % name,
+              abs(float(out[slots["duration"]]["inputs"]["value"]) - 7.0) < 1e-6)
+        # 宽高是 32 的整数倍且非零
+        res = out[slots["resolution"]]["inputs"]
+        w, h = res.get("自定义宽", 0), res.get("自定义高", 0)
+        check("%s fl2va 宽高是 32 倍数" % name,
+              w > 0 and h > 0 and w % 32 == 0 and h % 32 == 0, "w=%s h=%s" % (w, h))
+        check("%s fl2va 分辨率标记为自定义" % name, res.get("预设分辨率") == "自定义")
+        # seed / steps
+        check("%s fl2va seed 已写入" % name,
+              out[slots["seed"]]["inputs"].get("noise_seed") == 999)
+        check("%s fl2va steps 已写入" % name,
+              out[slots["steps"]]["inputs"].get("steps") == 12)
+        # 首尾帧：U02 有 first/last，U03 没有
+        if slots.get("first_frame"):
+            check("%s 首帧写入第 1 张图" % name,
+                  out[slots["first_frame"]]["inputs"].get("image") == "a.png")
+            check("%s 尾帧写入第 2 张图" % name,
+                  out[slots["last_frame"]]["inputs"].get("image") == "b.png")
+        # 缺图时塞占位，绝不能空串
+        wf2 = load_wf(p["file"])
+        out2 = patch_dispatch(wf2, [], "", pj, 7.0, 1, 12, "9:16", 0.5, p)
+        if slots.get("first_frame"):
+            check("%s 缺图时首帧塞占位非空串" % name,
+                  out2[slots["first_frame"]]["inputs"].get("image") == COMFY_PLACEHOLDER_IMAGE)
+            check("%s 缺图时尾帧塞占位非空串" % name,
+                  out2[slots["last_frame"]]["inputs"].get("image") == COMFY_PLACEHOLDER_IMAGE)
+
+    # ---- aggregate（U11）----
+    agg_models = [n for n, p in profiles.items() if p.get("mode") == "aggregate"]
+    check("存在 aggregate 形态档案", len(agg_models) >= 1, str(agg_models))
+    for name in agg_models:
+        p = profiles[name]
+        slots = p.get("slots") or {}
+        wf = load_wf(p["file"])
+        out = patch_dispatch(wf, ["a.png"], "", pj, 7.0, 555, 8, "9:16", 1.0, p)
+
+        check("%s 图片写入聚合源头" % name,
+              out[slots["image"]]["inputs"].get("image") == "a.png")
+        check("%s H3.ref_images 仍接聚合节点" % name,
+              out[slots["h3"]]["inputs"].get("ref_images") == [slots["aggregate"], 0])
+        # 没有音频时 H3 的音频槽必须断开
+        check("%s 无音频时 H3 音频槽断开" % name,
+              "ref_audios.ref_audio_0" not in out[slots["h3"]]["inputs"])
+        # 聚合节点只留 image_1
+        agg_ins = out[slots["aggregate"]]["inputs"]
+        check("%s 聚合节点只保留 image_1" % name,
+              "image_1" in agg_ins and not any(
+                  re.match(r"^image_\d+$", k) and k != "image_1" for k in agg_ins))
+        # 宽高 32 倍数
+        res = out[slots["resolution"]]["inputs"]
+        check("%s aggregate 宽高是 32 倍数" % name,
+              res.get("自定义宽", 0) % 32 == 0 and res.get("自定义高", 0) % 32 == 0)
+
+        # 有音频时：音频文件写进 VHS_LoadAudioUpload，且 H3 音频槽保留
+        wf2 = load_wf(p["file"])
+        pr = dict(p)
+        pr["audio_name"] = "vo.mp3"
+        out2 = patch_dispatch(wf2, ["a.png"], "", pj, 7.0, 555, 8, "9:16", 1.0, pr)
+        check("%s 有音频时音频文件已写入" % name,
+              out2[slots["audio"]]["inputs"].get("audio") == "vo.mp3")
+        check("%s 有音频时 H3 音频槽保留" % name,
+              "ref_audios.ref_audio_0" in out2[slots["h3"]]["inputs"])
+
+
+def test_upstream_probe():
+    print("\n[新] 上游探活与错误净化")
+    src = io.open(os.path.join(ROOT, "config", "comfy_core.php"), encoding="utf-8").read()
+    check("comfy_core.php 有 comfy_upstream_probe", "function comfy_upstream_probe" in src)
+    check("comfy_core.php 有 comfy_clean_error_body", "function comfy_clean_error_body" in src)
+    check("上游探活认 404=实例已回收", "实例已回收" in src)
+    check("上游探活给 switch_cloud 处置建议", "switch_cloud.py" in src)
+
+    cv = io.open(os.path.join(ROOT, "scripts", "create_video.php"), encoding="utf-8").read()
+    check("create_video.php 调用上游预检", "comfy_upstream_probe" in cv)
+    # 预检必须在收集素材之前（否则白等一次 60s 上传超时）
+    check("上游预检在收集素材之前",
+          cv.index("comfy_upstream_probe") < cv.index("collect_references()"))
+
+    idx = io.open(os.path.join(ROOT, "index.php"), encoding="utf-8").read()
+    check("index.php 的 /health 回报上游状态",
+          "upstream_alive" in idx and "comfy_upstream_probe" in idx)
+
+    ui = io.open(os.path.join(ROOT, "scripts", "upload_issue.php"), encoding="utf-8").read()
+    check("upload_issue.php 有 collect_audio", "function collect_audio" in ui)
+    check("collect_audio 认画布的 audio[] 字段", "audio[]" in ui)
 
 
 def test_profiles_patch(profiles):
@@ -44,14 +157,14 @@ def test_profiles_patch(profiles):
         out = patch_dispatch(wf, img_names, vid_name, pj, 7.0, 12345, 8, "16:9", 0.9, p)
         slots = p.get("slots") or {}
 
-        # 参考图：用了的写对、没用清空
+        # 参考图：用了的写对、没用塞占位（绝不能空串——LoadImage 读空路径会崩）
         imgs = slots.get("images") or {}
         ok_used = all(out[nid]["inputs"]["image"] == img_names[int(i)]
                       for i, nid in imgs.items() if int(i) < len(img_names))
-        ok_blank = all(out[nid]["inputs"]["image"] == ""
+        ok_blank = all(out[nid]["inputs"]["image"] == COMFY_PLACEHOLDER_IMAGE
                        for i, nid in imgs.items() if int(i) >= len(img_names))
         check("%s 参考图按槽位写入" % name, ok_used)
-        check("%s 未用图槽已清空（不会读到模板示例图）" % name, ok_blank)
+        check("%s 未用图槽塞占位非空串" % name, ok_blank)
 
         # prompt
         ps = slots.get("prompt")
@@ -68,6 +181,10 @@ def test_profiles_patch(profiles):
                   out[slots["h3"]]["inputs"].get("ref_video_audios.ref_video_audio_0") == [slots["pick"], 12])
             check("%s 独立音频槽已从 H3 断开" % name,
                   not any(k.startswith("ref_audios.") for k in out[slots["h3"]]["inputs"]))
+        elif p["mode"] in ("fl2va", "aggregate"):
+            # 新形态有自己的断言，见 test_new_modes
+            check("%s 新形态不误用 ref_* 分槽" % name,
+                  not any(k.startswith("ref_images.ref_image_") for k in out[slots["h3"]]["inputs"]))
         else:
             if isinstance(ps, list) and len(ps) == 2:
                 check("%s prompt 已写入节点 %s" % (name, ps[0]),
@@ -88,8 +205,13 @@ def test_profiles_patch(profiles):
                       all(h3[k] == [str((slots.get("videos") or {}).get("0", SLOT_VIDEO)), 2] for k in aud_slots))
 
     # 无视频时：视频/音频槽必须断开（否则会引用云机上不存在的文件）
+    # 注意：只对 slots/pickref 形态生效 —— fl2va/aggregate 的槽结构不同，
+    # aggregate 的 ref_audios.ref_audio_0 由音频文件决定（无音频时断开），
+    # fl2va 压根没有 ref_* 槽。
     broken = []
     for name, p in profiles.items():
+        if p.get("mode") in ("fl2va", "aggregate"):
+            continue
         wf = load_wf(p["file"])
         out = patch_dispatch(wf, img_names, "", pj, 7.0, 1, 8, "16:9", 0.9, p)
         slots = p.get("slots") or {}
@@ -98,6 +220,21 @@ def test_profiles_patch(profiles):
             if k.startswith("ref_videos.") or k.startswith("ref_audios.") or k.startswith("ref_video_audios."):
                 broken.append("%s:%s" % (name, k))
     check("无原视频时视频/音频槽全部断开", not broken, "; ".join(broken[:6]))
+
+    # 无视频时：带 videos 槽的工作流，VHS_LoadVideo 必须塞占位而非空串
+    empty_video = []
+    for name, p in profiles.items():
+        slots = p.get("slots") or {}
+        vid_map = slots.get("videos") or {}
+        if not vid_map:
+            continue
+        wf = load_wf(p["file"])
+        out = patch_dispatch(wf, img_names, "", pj, 7.0, 1, 8, "16:9", 0.9, p)
+        for nid in vid_map.values():
+            got = out.get(nid, {}).get("inputs", {}).get("video")
+            if got != COMFY_PLACEHOLDER_VIDEO:
+                empty_video.append("%s:%s=%r" % (name, nid, got))
+    check("无原视频时 VHS_LoadVideo 塞占位非空串", not empty_video, "; ".join(empty_video[:6]))
 
     # 未知模型回落到 U17
     check("未知模型回落到默认档案",
@@ -150,14 +287,15 @@ def patch_slots(wf, image_names, video_name, prompt_json, seconds, seed, steps, 
         img_map = {str(i): nid for i, nid in enumerate(H3_SLOT_IMAGES)}
     for idx, nid in img_map.items():
         if nid in wf:
-            wf[nid]["inputs"]["image"] = image_names[int(idx)] if int(idx) < len(image_names) else ""
+            wf[nid]["inputs"]["image"] = image_names[int(idx)] if int(idx) < len(image_names) else COMFY_PLACEHOLDER_IMAGE
 
     vid_map = slots.get("videos") or {}
     if not vid_map and SLOT_VIDEO in wf:
         vid_map = {"0": SLOT_VIDEO}
     for idx, nid in vid_map.items():
         if nid in wf:
-            wf[nid]["inputs"]["video"] = video_name if int(idx) == 0 else ""
+            real = video_name if int(idx) == 0 else ""
+            wf[nid]["inputs"]["video"] = real if real else COMFY_PLACEHOLDER_VIDEO
 
     ps = slots.get("prompt")
     if isinstance(ps, list) and len(ps) == 2 and ps[0] in wf and ps[1] in wf[ps[0]]["inputs"]:
@@ -204,11 +342,14 @@ def patch_pickref(wf, image_names, video_name, prompt_json, seconds, seed, steps
     for i in range(9):
         k = "ref_image_%d" % i
         if k in ins:
-            ins[k] = image_names[i] if i < len(image_names) else ""
+            ins[k] = image_names[i] if i < len(image_names) else COMFY_PLACEHOLDER_IMAGE
     for i in range(3):
         k = "ref_video_%d" % i
         if k in ins:
-            ins[k] = video_name if i == 0 else ""
+            if i == 0:
+                ins[k] = video_name if video_name else COMFY_PLACEHOLDER_VIDEO
+            else:
+                ins[k] = ""
     for i in range(3):
         k = "ref_audio_%d" % i
         if k in ins:
@@ -242,9 +383,145 @@ def patch_pickref(wf, image_names, video_name, prompt_json, seconds, seed, steps
     return wf
 
 
+def h3_dimensions(aspect, megapixels):
+    """h3_dimensions 的 Python 复刻：比例 + 百万像素 -> 32 倍整数宽高。"""
+    ratio = 16.0 / 9.0
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)", str(aspect or ""))
+    if m:
+        ratio = float(m.group(1)) / max(0.0001, float(m.group(2)))
+    mp = megapixels if megapixels > 0 else 0.9
+    total = mp * 1000000.0
+    w = int(round(math.sqrt(total * ratio)))
+    h = int(round(total / max(1, w)))
+    w = max(256, (int(w / 32)) * 32)
+    h = max(256, (int(h / 32)) * 32)
+    return [w, h]
+
+
+def build_fl2va_prompt(text, seconds, image_count=0):
+    """h3_build_fl2va_prompt 的 Python 复刻。"""
+    text = (text or "").strip() or "A short cinematic clip."
+    parts = [p.strip() for p in re.split(r"[\n。！？!?]+", text) if p.strip()]
+    if not parts:
+        parts = [text]
+    style = ("Cinematic live-action footage, natural lighting, stable camera, photorealistic detail, "
+             "consistent identity and wardrobe with the reference image."
+             if image_count > 0 else
+             "Cinematic live-action footage, natural lighting, stable camera, photorealistic detail.")
+    sec = max(1.0, seconds)
+    n = len(parts)
+    lines = []
+    for i, p in enumerate(parts):
+        lines.append("[%.1fs-%.1fs] %s" % (sec * i / n, sec * (i + 1) / n, p))
+    ambient = comfy_extract_ambience(text)
+    audio = "Audio: continuous natural ambient bed of the scene: " + ambient + "."
+    tail = ("All actions are shown as on-screen body movement only, not as spoken dialogue. "
+            "No on-screen text, no subtitles, no captions, no written words or titles appear anywhere in the frame.")
+    return style + "\n\nTimeline:\n" + "\n".join(lines) + "\n\n" + audio + "\n\n" + tail
+
+
+def patch_fl2va(wf, image_names, prompt_text, seconds, seed, steps, aspect, megapixels, profile):
+    """comfy_patch_fl2va_workflow 的 Python 复刻。"""
+    slots = profile.get("slots") or {}
+    h3_id = str(slots.get("h3") or "")
+    if h3_id not in wf:
+        raise ValueError("fl2va 工作流缺少 H3 主节点: " + h3_id)
+
+    wf[h3_id]["inputs"]["prompt"] = prompt_text
+
+    res = str(slots.get("resolution") or "")
+    if res and res in wf:
+        w, h = h3_dimensions(aspect, megapixels)
+        wf[res]["inputs"]["预设分辨率"] = "自定义"
+        wf[res]["inputs"]["自定义宽"] = w
+        wf[res]["inputs"]["自定义高"] = h
+
+    dur = str(slots.get("duration") or "")
+    if dur and dur in wf and "value" in wf[dur]["inputs"]:
+        wf[dur]["inputs"]["value"] = max(1.0, seconds)
+
+    sd = str(slots.get("seed") or "")
+    if sd and sd in wf:
+        wf[sd]["inputs"]["noise_seed"] = seed
+
+    st = str(slots.get("steps") or "")
+    if st and st in wf and "steps" in wf[st]["inputs"]:
+        wf[st]["inputs"]["steps"] = max(1, steps)
+
+    for key, idx in (("first_frame", 0), ("last_frame", 1)):
+        nid = str(slots.get(key) or "")
+        if not nid or nid not in wf:
+            continue
+        real = image_names[idx] if idx < len(image_names) else ""
+        wf[nid]["inputs"]["image"] = real if real else COMFY_PLACEHOLDER_IMAGE
+    return wf
+
+
+def patch_aggregate(wf, image_names, audio_name, prompt_text, seconds, seed, steps, aspect, megapixels, profile):
+    """comfy_patch_aggregate_workflow 的 Python 复刻。"""
+    slots = profile.get("slots") or {}
+    h3_id = str(slots.get("h3") or "")
+    if h3_id not in wf:
+        raise ValueError("聚合工作流缺少 H3 主节点: " + h3_id)
+
+    img = str(slots.get("image") or "")
+    if img and img in wf:
+        real = image_names[0] if image_names else ""
+        wf[img]["inputs"]["image"] = real if real else COMFY_PLACEHOLDER_IMAGE
+
+    agg = str(slots.get("aggregate") or "")
+    if agg and agg in wf:
+        for k in list(wf[agg]["inputs"].keys()):
+            if re.match(r"^image_\d+$", k) and k != "image_1":
+                del wf[agg]["inputs"][k]
+            elif k.startswith("video_") or k.startswith("audio_"):
+                del wf[agg]["inputs"][k]
+
+    aud = str(slots.get("audio") or "")
+    if aud and aud in wf:
+        if audio_name:
+            wf[aud]["inputs"]["audio"] = audio_name
+            if "duration" in wf[aud]["inputs"]:
+                wf[aud]["inputs"]["duration"] = max(1, int(math.ceil(seconds)))
+        else:
+            for k in ("ref_audios.ref_audio_0", "ref_audios.ref_audio_1"):
+                if k in wf[h3_id]["inputs"]:
+                    del wf[h3_id]["inputs"][k]
+
+    res = str(slots.get("resolution") or "")
+    if res and res in wf:
+        w, h = h3_dimensions(aspect, megapixels)
+        wf[res]["inputs"]["预设分辨率"] = "自定义"
+        wf[res]["inputs"]["自定义宽"] = w
+        wf[res]["inputs"]["自定义高"] = h
+
+    sd = str(slots.get("seed") or "")
+    if sd and sd in wf:
+        wf[sd]["inputs"]["noise_seed"] = seed
+
+    st = str(slots.get("steps") or "")
+    if st and st in wf and "steps" in wf[st]["inputs"]:
+        wf[st]["inputs"]["steps"] = max(1, steps)
+
+    pn = str(slots.get("prompt") or "")
+    if pn and pn in wf:
+        key = str(slots.get("prompt_key") or "提示词")
+        if key in wf[pn]["inputs"]:
+            wf[pn]["inputs"][key] = prompt_text
+    return wf
+
+
 def patch_dispatch(wf, image_names, video_name, prompt_json, seconds, seed, steps, aspect, megapixels, profile):
-    if profile.get("mode") == "pickref":
+    mode = profile.get("mode")
+    if mode == "pickref":
         return patch_pickref(wf, image_names, video_name, prompt_json, seconds, seed, steps, aspect, megapixels, profile)
+    if mode == "fl2va":
+        return patch_fl2va(wf, image_names, str(profile.get("prompt_text") or prompt_json),
+                           seconds, seed, steps, aspect, megapixels, profile)
+    if mode == "aggregate":
+        return patch_aggregate(wf, image_names, str(profile.get("audio_name") or ""),
+                               str(profile.get("prompt_text") or prompt_json),
+                               seconds, seed, steps, aspect, megapixels, profile)
     return patch_slots(wf, image_names, video_name, prompt_json, seconds, seed, steps, aspect, megapixels, profile)
 
 
@@ -357,23 +634,52 @@ def h3_build_prompt(text, image_count, mode="reference"):
         except Exception:
             pass
     parts = [p.strip() for p in re.split(r"[\n\u3002\uff01\uff1f!?]+", text) if p.strip()]
+    # subject_definitions 只锁身份，不写动作——动作写进 subject 会被 H3 当台词念
     subjects, retention = [], []
-    for i, p in enumerate(parts):
+    for i in range(max(1, len(parts))):
         n = i + 1
-        subjects.append("<Subject %d> is the person in <Picture %d>. %s" % (n, n, p))
+        subjects.append("<Subject %d> is the person in <Picture %d>." % (n, n))
         retention.append("<Subject %d> - fully_preserved - identity, clothing and key features from the reference image are retained." % n)
-    if not subjects:
-        subjects.append("<Subject 1> is the person in <Picture 1>.")
-        retention.append("<Subject 1> - fully_preserved - identity, clothing and key features from the reference image are retained.")
+    # 动作只写进 detailed_description 当纯视觉动作；不写 <d> 即无台词，但不全局禁人声
+    detailed = ("Natural cinematic motion, stable facial identity, consistent lighting. "
+                "The subject performs the following visible actions: " + " ".join(parts)
+                + ". All of it is shown as on-screen body movement only, not as spoken dialogue. "
+                + "No on-screen text, no subtitles, no captions, no written words or titles appear anywhere in the frame.")
+    soundscape = "Continuous natural ambient bed of the scene: " + comfy_extract_ambience(text) + "."
     return json.dumps({
         "subject_definitions": subjects,
-        "summary": " ".join(parts),
+        "summary": "A short cinematic clip following the reference subject in natural, coherent on-screen motion.",
         "retention_analysis": retention,
-        "detailed_description": ("Natural cinematic motion, stable facial identity, consistent lighting, "
-                                 "the subject performs the described action continuously and coherently across the whole clip."),
-        "overall_soundscape": "N/A",
+        "detailed_description": detailed,
+        "overall_soundscape": soundscape,
         "non_diegetic_music": "N/A",
     }, ensure_ascii=False)
+
+
+def comfy_extract_ambience(text):
+    """comfy_extract_ambience 的 Python 复刻：从描述提取环境音，无则安静底噪兜底。"""
+    t = str(text).lower()
+    table = [
+        ("鸟叫", "distant birdsong"), ("鸟鸣", "distant birdsong"), ("鸟儿", "distant birdsong"),
+        ("鸡叫", "rooster crowing"), ("鸡鸣", "rooster crowing"),
+        ("狗叫", "dog barking in the distance"), ("犬吠", "dog barking in the distance"),
+        ("虫鸣", "insect chirping"), ("蟋蟀", "cricket chirping"), ("蝉", "cicada drones"),
+        ("溪", "a nearby stream"), ("流水", "flowing water"), ("河", "river water"), ("水声", "water sounds"),
+        ("雨", "light rain"), ("风", "a gentle breeze"), ("树叶", "leaves rustling"),
+        ("乡村", "quiet countryside air"), ("农村", "quiet rural air"), ("田野", "open field air"),
+        ("海", "distant ocean surf"), ("浪", "ocean waves"), ("篝火", "a crackling fire"),
+        ("脚步", "soft footsteps"), ("车", "faint distant traffic"), ("集市", "distant marketplace murmur"),
+        ("宁静", "near silence"), ("安静", "near silence"),
+        ("bird", "distant birdsong"), ("rain", "light rain"), ("wind", "a gentle breeze"),
+        ("ocean", "distant ocean surf"), ("stream", "a nearby stream"), ("fire", "a crackling fire"),
+    ]
+    hits = []
+    for kw, desc in table:
+        if kw in t and desc not in hits:
+            hits.append(desc)
+    if not hits:
+        return "a very quiet, still room tone with no identifiable source"
+    return ", ".join(hits[:4])
 
 
 # 云机 ResolutionSelector 的**实际**枚举（2026-11-18 实测自 ComfyUI 0.44.0）
@@ -413,6 +719,47 @@ def h3_aspect(aspect):
     }.get(a, "16:9 (Widescreen)")
 
 
+def resolve_spec(post, defaults):
+    """comfy_resolve_spec 的 Python 复刻：画布规格优先，档案兜底。"""
+    def_secs = float(defaults.get("seconds", 5.0))
+    def_aspect = h3_aspect(str(defaults.get("aspect", "16:9")))
+    def_mp = float(defaults.get("megapixels", 0.9))
+
+    seconds = def_secs
+    raw = post.get("seconds", "")
+    if raw != "" and str(raw).replace(".", "", 1).isdigit():
+        s = float(raw)
+        if 4.0 <= s <= 30.0:
+            seconds = s
+
+    size = str(post.get("size", "")).strip().lower()
+    ratio = str(post.get("ratio", "")).strip().lower()
+    wh = None
+    import re as _re
+    m = _re.match(r"^(\d+)\s*x\s*(\d+)$", size)
+    if m:
+        wh = (int(m.group(1)), int(m.group(2)))
+
+    aspect = def_aspect
+    if ratio and ratio != "auto":
+        aspect = h3_aspect(ratio)
+    elif wh:
+        r = wh[0] / max(1, wh[1])
+        if r > 2.2: aspect = "21:9 (Ultrawide)"
+        elif r > 1.4: aspect = "16:9 (Widescreen)"
+        elif r > 1.1: aspect = "4:3 (Standard)"
+        elif r > 0.9: aspect = "1:1 (Square)"
+        elif r > 0.62: aspect = "3:4 (Portrait Standard)"
+        else: aspect = "9:16 (Portrait Widescreen)"
+
+    mp = def_mp
+    if wh:
+        v = wh[0] * wh[1] / 1e6
+        if 0.1 <= v <= 16.0:
+            mp = round(v, 3)
+    return {"seconds": seconds, "aspect": aspect, "megapixels": mp}
+
+
 def comfy_patch_workflow(wf, image_names, video_name, prompt_json, seconds, seed, steps, aspect, megapixels):
     for i, nid in enumerate(H3_SLOT_IMAGES):
         if nid not in wf:
@@ -420,8 +767,10 @@ def comfy_patch_workflow(wf, image_names, video_name, prompt_json, seconds, seed
         name = image_names[i] if i < len(image_names) else (image_names[-1] if image_names else None)
         if name:
             wf[nid]["inputs"]["image"] = name
-    if video_name and SLOT_VIDEO in wf:
-        wf[SLOT_VIDEO]["inputs"]["video"] = video_name
+    if SLOT_VIDEO in wf:
+        # 无视频时也要塞占位文件，与 PHP 部署代码一致：
+        # 空串会被 VHS_LoadVideo 拼成 /root/ComfyUI/input 目录 -> cv2 ValueError。
+        wf[SLOT_VIDEO]["inputs"]["video"] = video_name if video_name else COMFY_PLACEHOLDER_VIDEO
     if SLOT_PROMPT in wf:
         wf[SLOT_PROMPT]["inputs"]["value"] = prompt_json
     if SLOT_SECONDS in wf:
@@ -454,8 +803,10 @@ def test_prompt():
     check("七字段齐全", set(p.keys()) == {
         "subject_definitions", "summary", "retention_analysis",
         "detailed_description", "overall_soundscape", "non_diegetic_music"}, str(list(p.keys())))
-    check("summary 回填提示词", p["summary"] == "图中人物在喝茶", p["summary"])
+    check("summary 不复述动作原文", "喝茶" not in p["summary"], p["summary"])
     check("subject 含 Picture 1", "<Picture 1>" in p["subject_definitions"][0])
+    check("subject 只锁身份不带动作", "喝茶" not in p["subject_definitions"][0], p["subject_definitions"][0])
+    check("动作落到 detailed 当视觉动作", "喝茶" in p["detailed_description"], p["detailed_description"])
     check("retention 条数匹配", len(p["retention_analysis"]) == len(p["subject_definitions"]))
 
     p2 = json.loads(h3_build_prompt("第一句。第二句！第三句", 3))
@@ -467,6 +818,25 @@ def test_prompt():
 
     p4 = json.loads(h3_build_prompt("", 1))
     check("空提示词有兜底", bool(p4["summary"]))
+
+    # 声音编排：不固定禁人声，只写环境音；不写 <d> 即无台词
+    check("soundscape 不再全局禁人声", "no human voice" not in p["overall_soundscape"].lower(), p["overall_soundscape"])
+    check("soundscape 不再全局禁对白", "no dialogue" not in p["overall_soundscape"].lower())
+    check("soundscape 不再是 N/A", p["overall_soundscape"] != "N/A")
+    check("detailed 不写 <d> 台词标签", "<d>" not in p["detailed_description"])
+    check("detailed 动作标为视觉非台词", "not as spoken dialogue" in p["detailed_description"])
+    check("detailed 明确禁字幕", "no subtitles" in p["detailed_description"].lower()
+          and "no on-screen text" in p["detailed_description"].lower())
+
+    # 环境音提取：因场景而定
+    pb = json.loads(h3_build_prompt("乡村小院，有鸟叫和鸡鸣", 1))
+    check("提取鸟叫环境音", "birdsong" in pb["overall_soundscape"], pb["overall_soundscape"])
+    check("提取鸡鸣环境音", "rooster" in pb["overall_soundscape"], pb["overall_soundscape"])
+    check("提取乡村底噪", "countryside" in pb["overall_soundscape"].lower(), pb["overall_soundscape"])
+    pr = json.loads(h3_build_prompt("雨中溪边", 1))
+    check("提取雨声", "rain" in pr["overall_soundscape"], pr["overall_soundscape"])
+    check("提取溪水声", "stream" in pr["overall_soundscape"], pr["overall_soundscape"])
+    check("环境音不固定禁人声", "no human voice" not in pr["overall_soundscape"].lower())
 
 
 def test_aspect():
@@ -490,6 +860,47 @@ def test_aspect():
     # 已经是合法枚举的原样返回
     for e in ASPECT_ENUM:
         check("枚举原样透传 %s" % e, h3_aspect(e) == e)
+
+
+def test_resolve_spec():
+    print("\n[2b] 画布规格解析（画布优先，档案兜底）")
+    u24 = {"seconds": 10.0, "aspect": "16:9", "megapixels": 0.4}
+    u17 = {"seconds": 5.0, "aspect": "16:9", "megapixels": 0.9}
+
+    # 用户那次真实提交：size=480x854 / seconds=6 / ratio=9:16
+    s = resolve_spec({"seconds": "6", "size": "480x854", "ratio": "9:16"}, u24)
+    check("画布秒数6生效（不再回退10）", s["seconds"] == 6.0, str(s))
+    check("画布ratio 9:16生效", s["aspect"] == "9:16 (Portrait Widescreen)", str(s))
+    check("画布size反推0.41MP", abs(s["megapixels"] - 0.41) < 1e-6, str(s))
+
+    # 只给 size 不给 ratio：从 WxH 反推比例 + 像素
+    s = resolve_spec({"seconds": "8", "size": "1920x1080"}, u17)
+    check("无ratio时从size反推16:9", s["aspect"] == "16:9 (Widescreen)", str(s))
+    check("size反推2.07MP", abs(s["megapixels"] - 2.074) < 1e-6, str(s))
+
+    # 竖屏 size 反推
+    s = resolve_spec({"seconds": "10", "size": "720x1280"}, u17)
+    check("竖屏size反推9:16", s["aspect"] == "9:16 (Portrait Widescreen)", str(s))
+
+    # auto / 全缺失 -> 档案兜底
+    s = resolve_spec({"seconds": "6", "ratio": "auto", "size": "auto"}, u24)
+    check("auto时秒数仍用画布6", s["seconds"] == 6.0, str(s))
+    check("auto比例回退档案16:9", s["aspect"] == "16:9 (Widescreen)", str(s))
+    check("auto像素回退档案0.4", abs(s["megapixels"] - 0.4) < 1e-6, str(s))
+
+    s = resolve_spec({}, u24)
+    check("全缺失秒数回退档案10", s["seconds"] == 10.0, str(s))
+    check("全缺失比例回退档案", s["aspect"] == "16:9 (Widescreen)", str(s))
+    check("全缺失像素回退档案0.4", abs(s["megapixels"] - 0.4) < 1e-6, str(s))
+
+    # 秒数越界回退
+    s = resolve_spec({"seconds": "99", "size": "auto"}, u17)
+    check("秒数越界回退档案5", s["seconds"] == 5.0, str(s))
+
+    # 所有解析出的 aspect 必须落在云机枚举内
+    for post in [{"ratio": "9:16"}, {"size": "2560x1080"}, {"size": "1024x768"}, {"size": "480x854"}]:
+        sp = resolve_spec(post, u17)
+        check("解析aspect在枚举内 %s" % post, sp["aspect"] in ASPECT_ENUM, sp["aspect"])
 
 
 def test_workflow_patch():
@@ -523,6 +934,8 @@ def test_workflow_patch():
     check("断开 ref_audios", not any(k.startswith("ref_audios.") for k in h3i2))
     check("参考图仍在", out2["248"]["inputs"]["image"] == "r1.png")
     check("时长写入", out2["132"]["inputs"]["value"] == 5)
+    check("无视频塞占位而非空串", out2["256"]["inputs"]["video"] == COMFY_PLACEHOLDER_VIDEO,
+          out2["256"]["inputs"]["video"])
 
 
 def test_image_workflow():
@@ -816,8 +1229,8 @@ def test_profiles_table():
     check("档案表可解析且非空", isinstance(profiles, dict) and len(profiles) >= 10, "共 %d 个" % len(profiles))
     check("每个档案都有 file/mode/label/defaults",
           all(all(k in p for k in ("file", "mode", "label", "defaults")) for p in profiles.values()))
-    check("mode 只有 pickref / slots 两种",
-          all(p["mode"] in ("pickref", "slots") for p in profiles.values()),
+    check("mode 只有 pickref / slots / fl2va / aggregate 四种",
+          all(p["mode"] in ("pickref", "slots", "fl2va", "aggregate") for p in profiles.values()),
           str(sorted({p["mode"] for p in profiles.values()})))
 
     # 工作流文件都在
@@ -889,6 +1302,7 @@ def test_profiles_table():
 if __name__ == "__main__":
     test_prompt()
     test_aspect()
+    test_resolve_spec()
     test_workflow_patch()
     test_image_workflow()
     test_slot_truth()
@@ -904,6 +1318,8 @@ if __name__ == "__main__":
     _profiles = test_profiles_table()
     test_profiles_patch(_profiles)
     test_profile_workflow_pairing(_profiles)
+    test_new_modes(_profiles)
+    test_upstream_probe()
     print("\n" + "=" * 56)
     print("PASS=%d  FAIL=%d" % (PASS, FAIL))
     print("=" * 56)

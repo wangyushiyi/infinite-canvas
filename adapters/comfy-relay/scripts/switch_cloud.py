@@ -116,10 +116,19 @@ def status():
     d = json.loads(text)
     upstream = d.get("upstream", "")
     print("  upstream        :", upstream)
-    if upstream:
+    # 中继自身是否活着（/health 现在也会探活上游）
+    if "upstream_alive" in d:
+        print("  中继自身        : OK（PHP %s，dry_run=%s）" % (d.get("php"), d.get("dry_run")))
+        print("  上游是否可用    :", "是" if d.get("upstream_alive") else "否")
+        print("  上游状态码      :", d.get("upstream_status"))
+        print("  上游诊断        :", d.get("upstream_reason"))
+        if d.get("upstream_hint"):
+            print("  处置建议        :", d.get("upstream_hint"))
+    if upstream and "upstream_alive" not in d:
         ok, why, _ = probe(upstream, timeout=20)
         print("  上游探活        :", "OK" if ok else "FAIL")
         print("                   ", why)
+    print("  已注册模型数    :", d.get("video_models_total"))
     print()
     code, text = http("GET", RELAY + "/diag/upstream", timeout=45)
     print("=== /diag/upstream ===")

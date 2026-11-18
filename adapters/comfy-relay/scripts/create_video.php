@@ -36,21 +36,19 @@ $mode = trim((string) ($_POST['mode'] ?? 'reference'));
 $generateAudio = ($_POST['generate_audio'] ?? 'true') === 'true';
 $watermark = ($_POST['watermark'] ?? 'false') === 'true';
 
-// 规格优先级：**档案默认优先**，画布只在显式改了的时候才覆盖。
-//   - 秒数：画布内置默认是 6（normalizeVideoSeconds 的默认值），
-//           传 6 视为"未设置" -> 用档案默认；传别的值 -> 用画布的。
-//   - 宽高比 / 百万像素：属于 U 系自身的规格（u22v1 就是 9:16 竖屏），
-//           一律用档案默认，不接受画布覆盖，避免选错比例跑出废片。
+// 规格优先级：**画布设定优先**，档案只作兜底。
+//   画布 createOpenAIVideoTask 如实传 seconds / size(WIDTHxHEIGHT) / ratio / resolution_name，
+//   这里按画布值解析成 WorkFlow 能吃的 seconds / aspect / megapixels；
+//   画布传 auto 或没传的字段才回退档案默认（避免旧行为"锁死档案规格、忽略画布"）。
 $defaults = $profile['defaults'] ?? [];
-$rawSeconds = (float) ($_POST['seconds'] ?? 0);
-if ($rawSeconds > 0 && abs($rawSeconds - 6.0) > 0.01) {
-    $seconds = $rawSeconds;                       // 用户在画布里显式改了时长
-} else {
-    $seconds = (float) ($defaults['seconds'] ?? 5.0);
-}
-$aspect = (string) ($defaults['aspect'] ?? '16:9');
-$megapixels = (float) ($defaults['megapixels'] ?? 0.9);
+$spec = comfy_resolve_spec($_POST, $defaults);
+$seconds = $spec['seconds'];
+$aspect = $spec['aspect'];
+$megapixels = $spec['megapixels'];
 $steps = (int) ($defaults['steps'] ?? 8);
+// DRY_RUN 回显用的原值
+$size = (string) ($_POST['size'] ?? '');
+$ratio = (string) ($_POST['ratio'] ?? '');
 
 // 首尾帧模式：画布用 first_frame / last_frame
 $firstFrame = $_FILES['first_frame'] ?? null;
@@ -60,12 +58,27 @@ if ($prompt === '' && !isset($_POST['upload_id'])) {
     fail(400, '需要 prompt 或至少一张参考图');
 }
 
+// ---------------------------------------------------------------- 上游预检
+//
+// 云机是按小时计费的临时 AutoDL 实例，回收后网关仍然在线但所有路径秒回 404。
+// 这一步必须在**收集素材之前**：素材上传本身也要打云机，云机死了会白等
+// 一次 60s 上传超时，用户最后看到的是「上传失败 + 一屏 HTML」。
+// 预检只花一次轻量 GET（/system_stats），不通就直接给可执行的处置建议。
+if (!defined('COMFY_SKIP_UPSTREAM_PROBE')) {
+    $probe = comfy_upstream_probe(10);
+    if (!$probe['alive']) {
+        fail(502, '云机不可用：' . $probe['reason'] . '。' . $probe['hint']
+            . '（当前上游 ' . COMFY_BASE . '）');
+    }
+}
+
 // ---------------------------------------------------------------- 收集参考图 / 原视频
 
 // 优先走「浏览器直传云机」（文件不过中继，见 upload_issue.php 里的实测说明）；
 // 没有直传信息时才回退到「文件过中继」。
 $references = collect_references();
 $videoRef = collect_video();
+$audioRef = collect_audio();
 
 if (!$references && $mode !== 'frames') {
     fail(400, '至少需要 1 张参考图（直传请带 upload_id + cloud_name，或用 image[] 上传）');
@@ -105,10 +118,32 @@ if (DRY_RUN) {
 
 $imageNames = array_map(static fn($r) => $r['name'], $references);
 $videoName = $videoRef !== null ? $videoRef['name'] : '';
+$audioName = $audioRef !== null ? $audioRef['name'] : '';
 
 // ---------------------------------------------------------------- 编排工作流
+//
+// 三种 prompt 形态（按档案 mode 选）：
+//   slots / pickref -> ref2va 七字段 JSON（H3 的 prompt 是 JSON 对象）
+//   fl2va           -> 自然语言 + Timeline（MiniMaxH3ImageToVideo 的 prompt 是纯文本）
+//   aggregate       -> 交给工作流自己的 LLM 链生成（我们只在档案指定时覆盖）
+$patchMode = (string) ($profile['mode'] ?? 'slots');
+$promptJson = '';
+$promptText = '';
+if ($patchMode === 'fl2va') {
+    $promptText = h3_build_fl2va_prompt($prompt, $seconds, count($imageNames));
+    $promptJson = $promptText;
+} elseif ($patchMode === 'aggregate') {
+    // U11 的 prompt 由工作流内部的 LLM 链（音频转录 -> 分析 -> 生成）产出，
+    // 我们不抢它的活；用户提示词作为附加信息留在账本里。
+    $promptText = $prompt;
+    $promptJson = h3_build_prompt($prompt, max(1, count($imageNames)), $mode);
+} else {
+    $promptJson = h3_build_prompt($prompt, max(1, count($imageNames)), $mode);
+    $promptText = $promptJson;
+}
 
-$promptJson = h3_build_prompt($prompt, max(1, count($imageNames)), $mode);
+$profile['audio_name'] = $audioName;
+$profile['prompt_text'] = $promptText;
 
 $patched = comfy_patch_workflow(
     $wf,
@@ -171,6 +206,8 @@ state_put($taskId, [
     'steps' => $steps,
     'image_count' => count($imageNames),
     'has_video' => $videoName !== '',
+    'has_audio' => $audioName !== '',
+    'audio_name' => $audioName,
     'generate_audio' => $generateAudio,
     'watermark' => $watermark,
     'created_at' => time(),

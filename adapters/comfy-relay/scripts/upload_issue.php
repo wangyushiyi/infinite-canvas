@@ -156,6 +156,94 @@ function collect_references(): array
 }
 
 /**
+ * 参考音频：与参考图/原视频同一套约定。
+ *
+ * 画布 OpenAI 协议传的是 `audio[]`（见 web/src/services/api/video.ts:310）。
+ * 支持浏览器直传（upload_audio_id / audio_cloud_name）与文件过中继两种方式。
+ * 没有音频时返回 null（调用方按"无音频"处理）。
+ */
+function collect_audio(): ?array
+{
+    // 直传（数组式优先，与参考图同一约定）
+    $audioIds = $_POST['upload_audio_ids'] ?? ($_POST['upload_audio_ids[]'] ?? null);
+    $audioNames = $_POST['audio_cloud_names'] ?? ($_POST['audio_cloud_names[]'] ?? null);
+    if (is_array($audioNames) && $audioNames) {
+        $audioNames = array_values($audioNames);
+        $audioIds = is_array($audioIds) ? array_values($audioIds) : [];
+        $cn = trim((string) $audioNames[0]);
+        $uid = trim((string) ($audioIds[0] ?? ''));
+        if ($cn === '') {
+            return null;
+        }
+        $rec = state_get($uid);
+        if ($rec === null || ($rec['kind'] ?? '') !== 'upload') {
+            fail(400, 'upload_audio_id 无效或已过期');
+        }
+        if (!preg_match('/^[A-Za-z0-9._\-]+\.(mp3|wav|m4a|aac|ogg|flac)$/i', $cn)) {
+            fail(400, 'audio_cloud_name 非法');
+        }
+        state_put($uid, array_merge($rec, ['status' => 'uploaded', 'cloud_name' => $cn]));
+        return ['name' => $cn, 'via' => 'direct'];
+    }
+
+    $uploadId = trim((string) ($_POST['upload_audio_id'] ?? ''));
+    $cloudName = trim((string) ($_POST['audio_cloud_name'] ?? ''));
+    if ($uploadId !== '' && $cloudName !== '') {
+        $rec = state_get($uploadId);
+        if ($rec === null || ($rec['kind'] ?? '') !== 'upload') {
+            fail(400, 'upload_audio_id 无效或已过期');
+        }
+        if (!preg_match('/^[A-Za-z0-9._\-]+\.(mp3|wav|m4a|aac|ogg|flac)$/i', $cloudName)) {
+            fail(400, 'audio_cloud_name 非法');
+        }
+        state_put($uploadId, array_merge($rec, ['status' => 'uploaded', 'cloud_name' => $cloudName]));
+        return ['name' => $cloudName, 'via' => 'direct'];
+    }
+
+    foreach (['audio[]', 'audio', 'audios'] as $field) {
+        if (!isset($_FILES[$field])) {
+            continue;
+        }
+        $f = $_FILES[$field];
+        $items = [];
+        if (is_array($f['name'] ?? null)) {
+            foreach ($f['name'] as $i => $n) {
+                $items[] = [
+                    'tmp_name' => $f['tmp_name'][$i],
+                    'name' => $n,
+                    'error' => $f['error'][$i] ?? UPLOAD_ERR_OK,
+                    'type' => $f['type'][$i] ?? 'application/octet-stream',
+                    'size' => $f['size'][$i] ?? 0,
+                ];
+            }
+        } else {
+            $items[] = [
+                'tmp_name' => $f['tmp_name'],
+                'name' => $f['name'],
+                'error' => $f['error'] ?? UPLOAD_ERR_OK,
+                'type' => $f['type'] ?? 'application/octet-stream',
+                'size' => $f['size'] ?? 0,
+            ];
+        }
+        foreach ($items as $it) {
+            if (($it['error'] ?? UPLOAD_ERR_OK) !== UPLOAD_ERR_OK) {
+                continue;
+            }
+            $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', (string) $it['name']);
+            $ext = strtolower(pathinfo($safe, PATHINFO_EXTENSION)) ?: 'mp3';
+            $cloudName = 'canvas_audio_' . bin2hex(random_bytes(5)) . '.' . $ext;
+            $up = comfy_upload($it['tmp_name'], $cloudName, $it['type']);
+            if (!$up['ok']) {
+                fail(502, '参考音频上传到云机失败: ' . $up['error']);
+            }
+            return ['name' => $up['name'], 'via' => 'relay'];
+        }
+    }
+
+    return null;
+}
+
+/**
  * 原视频：同理，支持浏览器直传（upload_video_id / video_cloud_name）。
  * 没有原视频时返回 null。
  */

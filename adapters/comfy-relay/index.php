@@ -102,10 +102,18 @@ $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
 // --- 健康检查
 if ($path === '/health' || $path === '/') {
+    // 上游探活：AutoDL 实例回收后网关仍在线但全路径 404，
+    // 不探活的话 /health 永远显示 ok:true，会误导排查。
+    $probe = comfy_upstream_probe(8);
     send_json([
-        'ok' => true,
+        'ok' => $probe['alive'],
         'service' => 'comfy-relay',
         'upstream' => COMFY_BASE,
+        'upstream_alive' => $probe['alive'],
+        'upstream_status' => $probe['status'],
+        'upstream_reason' => $probe['reason'],
+        'upstream_hint' => $probe['hint'],
+        'upstream_latency_ms' => $probe['latency_ms'],
         'dry_run' => DRY_RUN,
         'workflow' => COMFY_VIDEO_WORKFLOW,
         'php' => PHP_VERSION,

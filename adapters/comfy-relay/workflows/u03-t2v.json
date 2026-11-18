@@ -1,0 +1,348 @@
+{
+ "120": {
+  "inputs": {
+   "预设分辨率": "自定义",
+   "横竖对调": false,
+   "批量大小": 1,
+   "自定义宽": 864,
+   "自定义高": 480,
+   "缩放倍数": "32"
+  },
+  "class_type": "WJILatentPreset",
+  "_meta": {
+   "title": "📐 Latent预设 (Empty Latent Preset)"
+  }
+ },
+ "126": {
+  "inputs": {
+   "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+  },
+  "class_type": "VAELoader",
+  "_meta": {
+   "title": "加载VAE"
+  }
+ },
+ "127": {
+  "inputs": {
+   "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+  },
+  "class_type": "VAELoader",
+  "_meta": {
+   "title": "加载VAE"
+  }
+ },
+ "128": {
+  "inputs": {
+   "samples": [
+    "147",
+    0
+   ],
+   "vae": [
+    "127",
+    0
+   ]
+  },
+  "class_type": "VAEDecodeAudio",
+  "_meta": {
+   "title": "VAE解码（音频）"
+  }
+ },
+ "130": {
+  "inputs": {
+   "sampler_name": "res_multistep"
+  },
+  "class_type": "KSamplerSelect",
+  "_meta": {
+   "title": "K采样器选择"
+  }
+ },
+ "131": {
+  "inputs": {
+   "scheduler": "simple",
+   "steps": 25,
+   "denoise": 1,
+   "model": [
+    "144",
+    0
+   ]
+  },
+  "class_type": "BasicScheduler",
+  "_meta": {
+   "title": "基本调度器"
+  }
+ },
+ "132": {
+  "inputs": {
+   "noise": [
+    "135",
+    0
+   ],
+   "guider": [
+    "133",
+    0
+   ],
+   "sampler": [
+    "130",
+    0
+   ],
+   "sigmas": [
+    "151",
+    0
+   ],
+   "latent_image": [
+    "137",
+    1
+   ]
+  },
+  "class_type": "SamplerCustomAdvanced",
+  "_meta": {
+   "title": "自定义采样器（高级）"
+  }
+ },
+ "133": {
+  "inputs": {
+   "model": [
+    "144",
+    0
+   ],
+   "conditioning": [
+    "137",
+    0
+   ]
+  },
+  "class_type": "BasicGuider",
+  "_meta": {
+   "title": "基本引导器"
+  }
+ },
+ "134": {
+  "inputs": {
+   "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+   "type": "minimax",
+   "device": "default"
+  },
+  "class_type": "CLIPLoader",
+  "_meta": {
+   "title": "加载CLIP"
+  }
+ },
+ "135": {
+  "inputs": {
+   "noise_seed": 1
+  },
+  "class_type": "RandomNoise",
+  "_meta": {
+   "title": "随机噪波"
+  }
+ },
+ "137": {
+  "inputs": {
+   "prompt": "Vaporwave title sequence look: pink and blue gradient palette, VHS tracking artifacts, Greek statue motifs, chrome palm trees, RGB chromatic aberration, lo-fi retro atmosphere, mood languid and nostalgic.\n\nTimeline:\n[0s-1s] VHS static opens the frame, the title \"COMFYUI\" appears with RGB split and a slight horizontal jitter.\n[1s-2.5s] Hard cut, a Greek plaster bust close-up, pink-purple gradient sky, a pixelated sun.\n[2.5s-4s] Clean \"STARRING\" credits appear, \"LATENT\" and \"CONTROLNET\" each shown exactly once.\n[4s-5s] Final card \"DIRECTED BY COMFYUI\" holds, one VHS tracking glitch settling into stability.\n\nHard cuts only, transitions landing with tape jumps, no push-ins, no dissolves.\n\nAudio: lo-fi vaporwave score, slow drum machine with soft bass, VHS tape-noise sample joins at 2.5s, melody fading for the last 1s.\n\nAll text must be clearly legible, do not misspell English, no Chinese characters, do not repeat names or job titles, no soft dissolves, no subtitle bars.",
+   "width": [
+    "120",
+    1
+   ],
+   "height": [
+    "120",
+    2
+   ],
+   "length": [
+    "138",
+    1
+   ],
+   "clip": [
+    "134",
+    0
+   ],
+   "vae": [
+    "126",
+    0
+   ]
+  },
+  "class_type": "MiniMaxH3ImageToVideo",
+  "_meta": {
+   "title": "MiniMax H3 Image to Video"
+  }
+ },
+ "138": {
+  "inputs": {
+   "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17",
+   "values.a": [
+    "139",
+    0
+   ]
+  },
+  "class_type": "ComfyMathExpression",
+  "_meta": {
+   "title": "数学表达式"
+  }
+ },
+ "139": {
+  "inputs": {
+   "value": 2
+  },
+  "class_type": "PrimitiveFloat",
+  "_meta": {
+   "title": "Float (duration)"
+  }
+ },
+ "140": {
+  "inputs": {
+   "unet_name": "minimax/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  },
+  "class_type": "UNETLoader",
+  "_meta": {
+   "title": "UNet加载器"
+  }
+ },
+ "142": {
+  "inputs": {
+   "chunks": 2,
+   "seq_threshold": 4096,
+   "model": [
+    "143",
+    0
+   ]
+  },
+  "class_type": "MiniMaxChunkFeedForward",
+  "_meta": {
+   "title": "MiniMax H3 Chunk FeedForward"
+  }
+ },
+ "143": {
+  "inputs": {
+   "head_chunks": 4,
+   "model": [
+    "145",
+    0
+   ]
+  },
+  "class_type": "MiniMaxLowVRAMAttention",
+  "_meta": {
+   "title": "MiniMax H3 Low VRAM Attention"
+  }
+ },
+ "144": {
+  "inputs": {
+   "max_resolution": 1024,
+   "jpeg_quality": 100,
+   "suppress_default_preview": true,
+   "preview_frames": [
+    "138",
+    1
+   ],
+   "preview_fps": 10,
+   "tiny_vae": "taeh3.safetensors",
+   "model": [
+    "142",
+    0
+   ]
+  },
+  "class_type": "ModelPreviewOverrideKJ",
+  "_meta": {
+   "title": "Model Preview Override"
+  }
+ },
+ "145": {
+  "inputs": {
+   "attention": "comfy kitchen attention",
+   "model": [
+    "140",
+    0
+   ]
+  },
+  "class_type": "ModelAttentionBackend",
+  "_meta": {
+   "title": "ModelAttentionBackend"
+  }
+ },
+ "146": {
+  "inputs": {
+   "samples": [
+    "147",
+    0
+   ],
+   "vae": [
+    "126",
+    0
+   ]
+  },
+  "class_type": "VAEDecode",
+  "_meta": {
+   "title": "VAE解码"
+  }
+ },
+ "147": {
+  "inputs": {
+   "offload_model": true,
+   "offload_cache": true,
+   "anything": [
+    "132",
+    0
+   ]
+  },
+  "class_type": "VRAMCleanup",
+  "_meta": {
+   "title": "🎈VRAM-Cleanup"
+  }
+ },
+ "149": {
+  "inputs": {
+   "frame_rate": 24,
+   "loop_count": 0,
+   "filename_prefix": "comfyui",
+   "format": "video/h264-mp4",
+   "pix_fmt": "yuv420p",
+   "crf": 16,
+   "save_metadata": false,
+   "trim_to_audio": false,
+   "pingpong": false,
+   "save_output": true,
+   "images": [
+    "150",
+    0
+   ],
+   "audio": [
+    "128",
+    0
+   ]
+  },
+  "class_type": "VHS_VideoCombine",
+  "_meta": {
+   "title": "Video Combine 🎥🅥🅗🅢"
+  }
+ },
+ "150": {
+  "inputs": {
+   "clean_file_cache": true,
+   "clean_processes": true,
+   "clean_dlls": true,
+   "retry_times": 3,
+   "anything": [
+    "146",
+    0
+   ]
+  },
+  "class_type": "RAMCleanup",
+  "_meta": {
+   "title": "🎈RAM-Cleanup"
+  }
+ },
+ "151": {
+  "inputs": {
+   "sigmas": [
+    "131",
+    0
+   ],
+   "extra_steps": 2,
+   "start_at_sigma": 0.65,
+   "end_at_sigma": 0,
+   "spacing": "cosine"
+  },
+  "class_type": "H3SigmaRefiner",
+  "_meta": {
+   "title": "H3 Sigma Refiner"
+  }
+ }
+}
