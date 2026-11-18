@@ -1,0 +1,112 @@
+{
+  "1": {
+    "inputs": {
+      "ckpt_name": "SDXL/sd_xl_base_1.0.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "加载 SDXL"
+    }
+  },
+  "2": {
+    "inputs": {
+      "text": "a beautiful photo",
+      "clip": ["1", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "正向提示词"
+    }
+  },
+  "3": {
+    "inputs": {
+      "text": "blurry, low quality, watermark, text, deformed",
+      "clip": ["1", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "负向提示词"
+    }
+  },
+  "4": {
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "空潜空间"
+    }
+  },
+  "5": {
+    "inputs": {
+      "model": ["1", 0],
+      "seed": 0,
+      "steps": 28,
+      "cfg": 6.0,
+      "sampler_name": "dpmpp_2m",
+      "scheduler": "karras",
+      "positive": ["2", 0],
+      "negative": ["3", 0],
+      "latent_image": ["4", 0],
+      "denoise": 1.0
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "采样"
+    }
+  },
+  "6": {
+    "inputs": {
+      "samples": ["5", 0],
+      "vae": ["1", 2]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "解码"
+    }
+  },
+  "7": {
+    "inputs": {
+      "images": ["6", 0],
+      "filename_prefix": "canvas/image/relay"
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "保存"
+    }
+  },
+  "8": {
+    "inputs": {
+      "image": "reference.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载参考图"
+    }
+  },
+  "9": {
+    "inputs": {
+      "pixels": ["8", 0],
+      "vae": ["1", 2]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "编码参考图"
+    }
+  },
+  "10": {
+    "inputs": {
+      "image": ["8", 0],
+      "upscale_method": "bicubic",
+      "width": 1024,
+      "height": 1024,
+      "crop": "center"
+    },
+    "class_type": "ImageScale",
+    "_meta": {
+      "title": "缩放参考图"
+    }
+  }
+}

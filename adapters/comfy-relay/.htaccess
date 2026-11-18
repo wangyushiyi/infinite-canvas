@@ -1,0 +1,34 @@
+# ---- 保护敏感配置 ----
+<IfModule mod_authz_core.c>
+    <Files "config.php">
+        Require all denied
+    </Files>
+    <FilesMatch "\.php$">
+        <Files "index.php">
+            Require all granted
+        </Files>
+    </FilesMatch>
+</IfModule>
+<IfModule !mod_authz_core.c>
+    <Files "config.php">
+        Order allow,deny
+        Deny from all
+    </Files>
+</IfModule>
+
+# ---- 内部状态目录不外露 ----
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^state/ - [F,L]
+    RewriteRule ^config/ - [F,L]
+    RewriteRule ^workflows/ - [F,L]
+    RewriteRule ^scripts/ - [F,L]
+</IfModule>
+
+# ---- 其它保护 ----
+<IfModule mod_headers.c>
+    Header set X-Content-Type-Options "nosniff"
+    Header set X-Frame-Options "SAMEORIGIN"
+</IfModule>
+
+Options -Indexes

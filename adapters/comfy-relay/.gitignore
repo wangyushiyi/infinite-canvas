@@ -1,0 +1,7 @@
+# ---- ComfyUI 云机渠道适配层 ----
+# 真实配置含密钥，禁止入库（模板见 config/config.example.php）
+adapters/comfy-relay/config/config.php
+# 运行时任务账本
+adapters/comfy-relay/state/
+# 部署时生成的一次性 lint 脚本
+adapters/comfy-relay/_prelint-*.php
