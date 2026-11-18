@@ -692,6 +692,15 @@ def test_upload_flow():
     check("有 uploads/issue 路由", "'/v1/uploads/issue'" in io.open(os.path.join(ROOT, "index.php"), encoding="utf-8").read())
     check("collect_references 支持 upload_id", "upload_id" in up)
     check("collect_references 支持 cloud_name", "cloud_name" in up)
+    # ⚠️ 多图必须用数组式字段名：PHP 解析 multipart 时同名字段只保留最后一个
+    check("多图支持 cloud_names[]", "cloud_names" in up and "is_array($cloudNames)" in up)
+    check("多图支持 upload_ids[]", "upload_ids" in up and "is_array($uploadIds)" in up)
+    check("数组式与单数式都支持", "'cloud_names[]'" in up and "'upload_id'" in up)
+    check("数组式做数量校验", "数量必须一一对应" in up)
+    check("原视频也支持数组式", "video_cloud_names" in up)
+    # 画布本身传多图用的就是 image[] / images（PHP 天然支持数组）
+    cv2 = io.open(os.path.join(ROOT, "scripts", "create_video.php"), encoding="utf-8").read()
+    check("create_video 走 collect_references", "collect_references()" in cv2)
     check("cloud_name 有白名单校验", "preg_match" in up and "A-Za-z0-9._\\-" in up)
     check("collect_video 返回 ?array", "function collect_video(): ?array" in up)
     check("直传优先于中继上传", "direct" in up and "relay" in up)

@@ -52,6 +52,44 @@ function collect_references(): array
     $refs = [];
 
     // ---- 方式 A：浏览器直传（推荐）----
+    //
+    // ⚠️ 多图必须用**数组式字段名** cloud_names[] / upload_ids[]：
+    //    PHP 解析 multipart 表单时，同名字段只保留**最后一个**，
+    //    重复的 upload_id/cloud_name 会丢图（实测 3 图只进 1 张，
+    //    其余槽拿到空值 -> ComfyUI 报 LoadImage IsADirectoryError）。
+    //    带 [] 的字段名 PHP 会解析成数组，才是多图的正确载体。
+    //    （画布本身传多图用的就是 image[] / images，PHP 天然支持数组。）
+    $uploadIds = $_POST['upload_ids'] ?? ($_POST['upload_ids[]'] ?? null);
+    $cloudNames = $_POST['cloud_names'] ?? ($_POST['cloud_names[]'] ?? null);
+    if (is_array($uploadIds) || is_array($cloudNames)) {
+        $uploadIds = is_array($uploadIds) ? array_values($uploadIds) : [];
+        $cloudNames = is_array($cloudNames) ? array_values($cloudNames) : [];
+        foreach ($cloudNames as $i => $cn) {
+            $cn = trim((string) $cn);
+            if ($cn === '') {
+                continue;
+            }
+            $uid = trim((string) ($uploadIds[$i] ?? ''));
+            if ($uid === '') {
+                fail(400, 'cloud_names[] 与 upload_ids[] 数量必须一一对应');
+            }
+            $rec = state_get($uid);
+            if ($rec === null || ($rec['kind'] ?? '') !== 'upload') {
+                fail(400, 'upload_id 无效或已过期，请重新申请上传令牌');
+            }
+            if (!preg_match('/^[A-Za-z0-9._\-]+$/', $cn)) {
+                fail(400, 'cloud_name 非法');
+            }
+            if (!preg_match('/\.(jpg|jpeg|png|webp)$/i', $cn)) {
+                fail(400, 'cloud_name 扩展名不支持');
+            }
+            state_put($uid, array_merge($rec, ['status' => 'uploaded', 'cloud_name' => $cn]));
+            $refs[] = ['name' => $cn, 'via' => 'direct'];
+        }
+        return $refs;
+    }
+
+    // 单数形式（只有一张图时用）
     $uploadId = trim((string) ($_POST['upload_id'] ?? ''));
     $cloudName = trim((string) ($_POST['cloud_name'] ?? ''));
     if ($uploadId !== '' && $cloudName !== '') {
@@ -123,6 +161,28 @@ function collect_references(): array
  */
 function collect_video(): ?array
 {
+    // 数组式优先（与参考图同一约定）；原视频通常只有 1 个（槽 0）
+    $videoIds = $_POST['upload_video_ids'] ?? ($_POST['upload_video_ids[]'] ?? null);
+    $videoNames = $_POST['video_cloud_names'] ?? ($_POST['video_cloud_names[]'] ?? null);
+    if (is_array($videoNames) && $videoNames) {
+        $videoNames = array_values($videoNames);
+        $videoIds = is_array($videoIds) ? array_values($videoIds) : [];
+        $cn = trim((string) $videoNames[0]);
+        $uid = trim((string) ($videoIds[0] ?? ''));
+        if ($cn === '') {
+            return null;
+        }
+        $rec = state_get($uid);
+        if ($rec === null || ($rec['kind'] ?? '') !== 'upload') {
+            fail(400, 'upload_video_id 无效或已过期');
+        }
+        if (!preg_match('/^[A-Za-z0-9._\-]+\.(mp4|mov|mkv|webm)$/i', $cn)) {
+            fail(400, 'video_cloud_name 非法');
+        }
+        state_put($uid, array_merge($rec, ['status' => 'uploaded', 'cloud_name' => $cn]));
+        return ['name' => $cn, 'via' => 'direct'];
+    }
+
     $uploadId = trim((string) ($_POST['upload_video_id'] ?? ''));
     $cloudName = trim((string) ($_POST['video_cloud_name'] ?? ''));
     if ($uploadId !== '' && $cloudName !== '') {
