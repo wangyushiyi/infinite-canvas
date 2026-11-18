@@ -6,7 +6,10 @@
  */
 declare(strict_types=1);
 
-$taskId = $argv[1] ?? ($_GET['id'] ?? '');
+// index.php 路由已注入 $taskId；这里再兜底 CLI/直接访问场景
+if (!isset($taskId) || $taskId === '') {
+    $taskId = $argv[1] ?? ($_GET['id'] ?? '');
+}
 if (!preg_match('/^[A-Za-z0-9_\-]+$/', (string) $taskId)) {
     fail(400, '非法 task id');
 }

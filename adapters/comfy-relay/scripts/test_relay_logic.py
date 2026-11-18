@@ -74,7 +74,17 @@ def h3_build_prompt(text, image_count, mode="reference"):
     }, ensure_ascii=False)
 
 
+# 云机 ResolutionSelector 的**实际**枚举（2026-11-18 实测自 ComfyUI 0.44.0）
+# ⚠️ 枚举写错 -> ComfyUI 报 "Value not in list" -> 表现为 success 但 outputs 为空
+ASPECT_ENUM = [
+    "1:1 (Square)", "2:3 (Portrait Photo)", "3:2 (Photo)", "3:4 (Portrait Standard)",
+    "4:3 (Standard)", "9:16 (Portrait Widescreen)", "16:9 (Widescreen)", "21:9 (Ultrawide)",
+]
+
+
 def h3_aspect(aspect):
+    if aspect in ASPECT_ENUM:
+        return aspect
     a = (aspect or "").strip()
     if not a:
         return "16:9 (Widescreen)"
@@ -83,20 +93,21 @@ def h3_aspect(aspect):
         w, h = int(m.group(1)), int(m.group(2))
         r = w / max(1, h)
         if r > 2.2:
-            return "21:9 (Cinematic)"
+            return "21:9 (Ultrawide)"
         if r > 1.4:
             return "16:9 (Widescreen)"
         if r > 1.1:
             return "4:3 (Standard)"
         if r > 0.9:
             return "1:1 (Square)"
-        if r > 0.65:
-            return "3:4 (Portrait)"
-        return "9:16 (Vertical)"
+        if r > 0.62:
+            return "3:4 (Portrait Standard)"
+        return "9:16 (Portrait Widescreen)"
     return {
         "16:9": "16:9 (Widescreen)", "4:3": "4:3 (Standard)", "1:1": "1:1 (Square)",
-        "3:4": "3:4 (Portrait)", "9:16": "9:16 (Vertical)", "21:9": "21:9 (Cinematic)",
-        "auto": "16:9 (Widescreen)",
+        "3:2": "3:2 (Photo)", "2:3": "2:3 (Portrait Photo)",
+        "3:4": "3:4 (Portrait Standard)", "9:16": "9:16 (Portrait Widescreen)",
+        "21:9": "21:9 (Ultrawide)", "auto": "16:9 (Widescreen)",
     }.get(a, "16:9 (Widescreen)")
 
 
@@ -159,15 +170,24 @@ def test_prompt():
 def test_aspect():
     print("\n[2] 尺寸 -> aspect 换算")
     cases = [
-        ("16:9", "16:9 (Widescreen)"), ("480x640", "3:4 (Portrait)"),
+        ("16:9", "16:9 (Widescreen)"), ("480x640", "3:4 (Portrait Standard)"),
         ("1024x1024", "1:1 (Square)"), ("1920x1080", "16:9 (Widescreen)"),
-        ("720x1280", "9:16 (Vertical)"), ("", "16:9 (Widescreen)"),
-        ("auto", "16:9 (Widescreen)"), ("2560x1080", "21:9 (Cinematic)"),
-        ("1024x768", "4:3 (Standard)"),
+        ("720x1280", "9:16 (Portrait Widescreen)"), ("", "16:9 (Widescreen)"),
+        ("auto", "16:9 (Widescreen)"), ("2560x1080", "21:9 (Ultrawide)"),
+        ("1024x768", "4:3 (Standard)"), ("3:4", "3:4 (Portrait Standard)"),
+        ("9:16", "9:16 (Portrait Widescreen)"), ("2:3", "2:3 (Portrait Photo)"),
+        ("3:2", "3:2 (Photo)"), ("21:9", "21:9 (Ultrawide)"),
     ]
     for src, want in cases:
         got = h3_aspect(src)
         check("aspect %r -> %s" % (src, want), got == want, "got %s" % got)
+    # 关键：所有返回值必须落在云机真实枚举里
+    for src, _ in cases:
+        got = h3_aspect(src)
+        check("aspect %r 在云机枚举内" % src, got in ASPECT_ENUM, got)
+    # 已经是合法枚举的原样返回
+    for e in ASPECT_ENUM:
+        check("枚举原样透传 %s" % e, h3_aspect(e) == e)
 
 
 def test_workflow_patch():
@@ -184,7 +204,7 @@ def test_workflow_patch():
     check("不足的槽位用最后一张补齐", out["247"]["inputs"]["image"] == "r2.png", out["247"]["inputs"]["image"])
     check("原视频进 VHS_LoadVideo", out["256"]["inputs"]["video"] == "src.mp4")
     check("时长写入 132", out["132"]["inputs"]["value"] == 6)
-    check("分辨率写入 115", out["115"]["inputs"]["aspect_ratio"] == "3:4 (Portrait)" and out["115"]["inputs"]["megapixels"] == 0.5)
+    check("分辨率写入 115", out["115"]["inputs"]["aspect_ratio"] == "3:4 (Portrait Standard)" and out["115"]["inputs"]["megapixels"] == 0.5)
     check("seed 写入 129", out["129"]["inputs"]["noise_seed"] == 12345)
     check("steps 写入 184", out["184"]["inputs"]["value"] == 8)
     h3i = out["275"]["inputs"]
@@ -273,7 +293,8 @@ def test_php_files():
     print("\n[7] PHP 文件静态检查（无 php.exe，做字符串感知的括号平衡与关键符号检查）")
     for rel in ["index.php", "config/config.php", "config/comfy_core.php",
                 "scripts/create_video.php", "scripts/poll_video.php",
-                "scripts/fetch_content.php", "scripts/create_image.php"]:
+                "scripts/fetch_content.php", "scripts/create_image.php",
+                "scripts/poll_image.php", "scripts/upload_issue.php"]:
         p = os.path.join(ROOT, rel)
         src = io.open(p, encoding="utf-8").read()
         check("%s 存在" % rel, os.path.isfile(p))
@@ -306,6 +327,118 @@ def test_deploy_manifest():
     check("真实配置里没有占位符", "CHANGE_ME_RELAY_KEY" not in real)
 
 
+def strip_prefix(path, marker="/comfy-relay"):
+    """与 PHP index.php 的前缀剥离逻辑等价。"""
+    pos = path.find(marker)
+    if pos >= 0:
+        path = path[pos + len(marker):]
+    return "/" + path.strip("/")
+
+
+def test_routing():
+    print("\n[9] 路由前缀剥离（与 PHP 等价）")
+    cases = [
+        ("/comfy-relay", "/"),
+        ("/comfy-relay/", "/"),
+        ("/comfy-relay/health", "/health"),
+        ("/comfy-relay/v1/videos", "/v1/videos"),
+        ("/comfy-relay/v1/videos/abc123", "/v1/videos/abc123"),
+        ("/comfy-relay/v1/videos/abc123/content", "/v1/videos/abc123/content"),
+        ("/comfy-relay/v1/images/generations", "/v1/images/generations"),
+        ("/comfy-relay/v1/images/edits", "/v1/images/edits"),
+    ]
+    for src, want in cases:
+        got = strip_prefix(src)
+        check("路由 %s -> %s" % (src, want), got == want, "got %s" % got)
+
+
+def test_htaccess():
+    print("\n[10] .htaccess 路由规则")
+    ha = io.open(os.path.join(ROOT, ".htaccess"), encoding="utf-8").read()
+    check("有 RewriteEngine On", "RewriteEngine On" in ha)
+    check("有通用 rewrite 到 index.php", "index.php [QSA,L]" in ha)
+    check("排除真实文件", "%{REQUEST_FILENAME} !-f" in ha)
+    check("排除真实目录", "%{REQUEST_FILENAME} !-d" in ha)
+    for d in ("state/", "config/", "workflows/", "scripts/"):
+        check("屏蔽目录 %s" % d, ("RewriteRule ^%s - [F,L]" % d) in ha)
+    check("保护 config.php", 'Files "config.php"' in ha)
+    check("禁止列目录", "Options -Indexes" in ha)
+    # 屏蔽规则必须在通用 rewrite 之前
+    i_block = ha.find("RewriteRule ^state/")
+    i_general = ha.find("RewriteRule ^(.*)$ index.php")
+    check("屏蔽规则在通用 rewrite 之前", 0 <= i_block < i_general, "block@%d general@%d" % (i_block, i_general))
+
+
+def test_strip_meta_nodes():
+    print("\n[11] 元数据节点剔除（防 _api_config 类 400）")
+    wf = json.load(io.open(os.path.join(WF_DIR, "API-U17-9图1视频3音频V1-api.json"), encoding="utf-8"))
+    check("原始含 _api_config", "_api_config" in wf, "keys=%s" % list(wf.keys())[:5])
+    stripped = {k: v for k, v in wf.items()
+                if isinstance(v, dict) and v.get("class_type")}
+    check("剔除后不含 _api_config", "_api_config" not in stripped)
+    check("剔除后节点数 = 原数-1", len(stripped) == len(wf) - 1, "%d vs %d" % (len(stripped), len(wf)))
+    check("剔除后仍保留 275", "275" in stripped)
+    check("剔除后仍保留 250", "250" in stripped)
+    # 模拟 ComfyUI 的校验：所有节点必须有 class_type
+    bad = [k for k, v in stripped.items() if not v.get("class_type")]
+    check("所有节点都有 class_type", not bad, str(bad))
+
+
+def test_upload_flow():
+    print("\n[12] 上传令牌流程约定")
+    up = io.open(os.path.join(ROOT, "scripts", "upload_issue.php"), encoding="utf-8").read()
+    check("有 uploads/issue 路由", "'/v1/uploads/issue'" in io.open(os.path.join(ROOT, "index.php"), encoding="utf-8").read())
+    check("collect_references 支持 upload_id", "upload_id" in up)
+    check("collect_references 支持 cloud_name", "cloud_name" in up)
+    check("cloud_name 有白名单校验", "preg_match" in up and "A-Za-z0-9._\\-" in up)
+    check("collect_video 返回 ?array", "function collect_video(): ?array" in up)
+    check("直传优先于中继上传", "direct" in up and "relay" in up)
+    cv = io.open(os.path.join(ROOT, "scripts", "create_video.php"), encoding="utf-8").read()
+    check("create_video 引入 upload_issue", "require __DIR__ . '/upload_issue.php'" in cv)
+    check("create_video 用 collect_references", "collect_references()" in cv)
+    check("create_video 用 collect_video", "collect_video()" in cv)
+
+
+def test_retry_and_timeout():
+    print("\n[13] 重试与超时（Hostinger->云机 25% 超时率）")
+    core = io.open(os.path.join(ROOT, "config", "comfy_core.php"), encoding="utf-8").read()
+    check("comfy_request 有重试循环", "for ($attempt = 0; $attempt <= $retries" in core)
+    check("连接错误会重试", "if ($last['error'] !== null) {" in core)
+    check("5xx/429 会重试", "$last['status'] >= 500 || $last['status'] === 429" in core)
+    check("有退避 sleep", "sleep(1 << ($attempt - 1))" in core)
+    cv = io.open(os.path.join(ROOT, "scripts", "create_video.php"), encoding="utf-8").read()
+    check("提交超时控制在 PHP 上限内", "'timeout' => 12" in cv)
+    check("body 类型不是 array 约束", "?array $body = null" not in core)
+
+
+def test_route_param_passing():
+    print("\n[14] 路由参数传递（$argv 补齐，防「非法 task id」）")
+    idx = io.open(os.path.join(ROOT, "index.php"), encoding="utf-8").read()
+    # 三处带 id 的路由，require 前都必须设 $argv
+    routes = [
+        ("videos poll", "#^/v1/videos/([A-Za-z0-9_\\-]+)$#", "poll_video.php"),
+        ("videos content", "#^/v1/videos/([A-Za-z0-9_\\-]+)/content$#", "fetch_content.php"),
+        ("images poll", "#^/v1/images/([A-Za-z0-9_\\-]+)$#", "poll_image.php"),
+    ]
+    for label, pat, script in routes:
+        i = idx.find(pat)
+        check("%s 路由存在" % label, i >= 0, pat)
+        if i < 0:
+            continue
+        seg = idx[i:i + 400]
+        j = seg.find("require")
+        check("%s require 前注入了 $taskId" % label, "$taskId = $m[1];" in seg[:j] if j > 0 else False,
+              seg[:160])
+        check("%s require 目标正确" % label, script in seg[:j + 80] if j > 0 else False)
+    # 脚本侧：优先用 index.php 注入的 $taskId，再兜底 CLI
+    for script in ("poll_video.php", "poll_image.php", "fetch_content.php"):
+        src = io.open(os.path.join(ROOT, "scripts", script), encoding="utf-8").read()
+        check("%s 优先用注入的 $taskId" % script,
+              "if (!isset($taskId) || $taskId === '')" in src)
+        check("%s 有 id 白名单校验" % script,
+              "preg_match('/^[A-Za-z0-9_\\-]+$/', (string) $taskId)" in src)
+
+
 if __name__ == "__main__":
     test_prompt()
     test_aspect()
@@ -314,6 +447,12 @@ if __name__ == "__main__":
     test_slot_truth()
     test_php_files()
     test_deploy_manifest()
+    test_routing()
+    test_htaccess()
+    test_strip_meta_nodes()
+    test_upload_flow()
+    test_retry_and_timeout()
+    test_route_param_passing()
     print("\n" + "=" * 56)
     print("PASS=%d  FAIL=%d" % (PASS, FAIL))
     print("=" * 56)

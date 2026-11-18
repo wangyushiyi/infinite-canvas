@@ -40,13 +40,16 @@ const SLOT_LENGTH = '131';
  *
  * @param string $method
  * @param string $url
- * @param array|null $body
+ * @param mixed $body null|string|array（array 会自动 json_encode）
  * @param array $headers
  * @param array $opts
  * @return array{status:int, body:string, json:?array, error:?string}
  */
-function http_request(string $method, string $url, ?array $body = null, array $headers = [], array $opts = []): array
+function http_request(string $method, string $url, $body = null, array $headers = [], array $opts = []): array
 {
+    if (is_array($body)) {
+        $body = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    }
     $ch = curl_init();
     $headerLines = [];
     foreach ($headers as $k => $v) {
@@ -84,14 +87,43 @@ function http_request(string $method, string $url, ?array $body = null, array $h
     ];
 }
 
-/** 云机请求的统一入口：自动带鉴权头。 */
-function comfy_request(string $method, string $path, ?array $body = null, array $headers = [], array $opts = []): array
+/**
+ * 云机请求的统一入口：自动带鉴权头 + 重试。
+ *
+ * 重试是必需的（实测）：Hostinger → AutoDL 云机的跨境链路有 ~25% 超时率
+ * （延迟 0.6-2s 正常，但会整次超时）。同一主机 → apigo 则稳定在 1s 内，
+ * 说明是 AutoDL 公网入口对海外主机的链路质量问题，不是代码问题。
+ *
+ * 只对幂等/可重试的失败重试：连接错误、5xx、429。
+ */
+function comfy_request(string $method, string $path, $body = null, array $headers = [], array $opts = []): array
 {
     $headers['User-Agent'] = 'comfy-relay/1.0';
     if (COMFY_TOKEN !== '') {
         $headers['Authorization'] = 'Bearer ' . COMFY_TOKEN;
     }
-    return http_request($method, COMFY_BASE . $path, $body, $headers, $opts);
+    $retries = (int) ($opts['retries'] ?? 3);
+    $last = ['status' => 0, 'body' => '', 'json' => null, 'error' => null];
+
+    for ($attempt = 0; $attempt <= $retries; $attempt++) {
+        if ($attempt > 0) {
+            // 退避：1s / 2s / 4s
+            sleep(1 << ($attempt - 1));
+        }
+        $last = http_request($method, COMFY_BASE . $path, $body, $headers, $opts);
+
+        // 连接层失败 -> 重试
+        if ($last['error'] !== null) {
+            continue;
+        }
+        // 5xx / 429 -> 重试
+        if ($last['status'] >= 500 || $last['status'] === 429) {
+            continue;
+        }
+        return $last;
+    }
+
+    return $last;
 }
 
 // ---------------------------------------------------------------- 文件上传
@@ -113,14 +145,19 @@ function comfy_upload(string $localPath, string $name, string $mime = 'applicati
         return ['ok' => false, 'error' => '复制到临时文件失败'];
     }
     $ch = curl_init();
+    $upHeaders = COMFY_TOKEN !== '' ? ['Authorization: Bearer ' . COMFY_TOKEN] : [];
+    // 禁用 Expect: 100-continue —— 部分共享主机的出栈代理不处理 100-continue 握手，
+    // 会让 multipart 上传一直挂到超时。
+    $upHeaders[] = 'Expect:';
     curl_setopt_array($ch, [
         CURLOPT_URL => COMFY_BASE . '/upload/image',
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => 300,
+        CURLOPT_TIMEOUT => 60,
+        CURLOPT_CONNECTTIMEOUT => 15,
         CURLOPT_POST => true,
         CURLOPT_SSL_VERIFYPEER => true,
         CURLOPT_SSL_VERIFYHOST => 2,
-        CURLOPT_HTTPHEADER => COMFY_TOKEN !== '' ? ['Authorization: Bearer ' . COMFY_TOKEN] : [],
+        CURLOPT_HTTPHEADER => $upHeaders,
     ]);
     curl_setopt($ch, CURLOPT_POSTFIELDS, [
         'image' => new CURLFile($tmp, $mime, $name),
@@ -203,9 +240,35 @@ function h3_build_prompt(string $text, int $imageCount, string $mode = 'referenc
     ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 }
 
-/** 把 aspect 字符串（16:9 / 3:4 / 480x640 / auto）转成 ComfyUI ResolutionSelector 认的值。 */
+/**
+ * 把 aspect 字符串（16:9 / 3:4 / 480x640 / auto）转成 ComfyUI ResolutionSelector 认的值。
+ *
+ * ⚠️ 枚举值必须与云机 **实际** 的 ResolutionSelector 完全一致，否则
+ *    ComfyUI 会报 "Value not in list: aspect_ratio: '...' not in [...]"，
+ *    而这个错误**不会**出现在 /history 里（只写进 comfyui_6006.log），
+ *    表现为「success 但 outputs 为空」，极易误判。
+ *
+ * 云机实测枚举（2026-11-18，ComfyUI 0.44.0）：
+ *   1:1 (Square) | 2:3 (Portrait Photo) | 3:2 (Photo) | 3:4 (Portrait Standard)
+ *   4:3 (Standard) | 9:16 (Portrait Widescreen) | 16:9 (Widescreen) | 21:9 (Ultrawide)
+ */
 function h3_aspect(string $aspect): string
 {
+    static $exact = [
+        '1:1 (Square)' => '1:1 (Square)',
+        '2:3 (Portrait Photo)' => '2:3 (Portrait Photo)',
+        '3:2 (Photo)' => '3:2 (Photo)',
+        '3:4 (Portrait Standard)' => '3:4 (Portrait Standard)',
+        '4:3 (Standard)' => '4:3 (Standard)',
+        '9:16 (Portrait Widescreen)' => '9:16 (Portrait Widescreen)',
+        '16:9 (Widescreen)' => '16:9 (Widescreen)',
+        '21:9 (Ultrawide)' => '21:9 (Ultrawide)',
+    ];
+    // 已经是合法枚举值，原样返回
+    if (isset($exact[$aspect])) {
+        return $aspect;
+    }
+
     $a = trim($aspect);
     if ($a === '') {
         return '16:9 (Widescreen)';
@@ -215,7 +278,7 @@ function h3_aspect(string $aspect): string
         $h = (int) $m[2];
         $r = $w / max(1, $h);
         if ($r > 2.2) {
-            return '21:9 (Cinematic)';
+            return '21:9 (Ultrawide)';
         }
         if ($r > 1.4) {
             return '16:9 (Widescreen)';
@@ -226,24 +289,49 @@ function h3_aspect(string $aspect): string
         if ($r > 0.9) {
             return '1:1 (Square)';
         }
-        if ($r > 0.65) {
-            return '3:4 (Portrait)';
+        if ($r > 0.62) {
+            return '3:4 (Portrait Standard)';
         }
-        return '9:16 (Vertical)';
+        return '9:16 (Portrait Widescreen)';
     }
     $map = [
         '16:9' => '16:9 (Widescreen)',
         '4:3' => '4:3 (Standard)',
+        '3:2' => '3:2 (Photo)',
         '1:1' => '1:1 (Square)',
-        '3:4' => '3:4 (Portrait)',
-        '9:16' => '9:16 (Vertical)',
-        '21:9' => '21:9 (Cinematic)',
+        '2:3' => '2:3 (Portrait Photo)',
+        '3:4' => '3:4 (Portrait Standard)',
+        '9:16' => '9:16 (Portrait Widescreen)',
+        '21:9' => '21:9 (Ultrawide)',
         'auto' => '16:9 (Widescreen)',
     ];
     return $map[$a] ?? '16:9 (Widescreen)';
 }
 
 // ---------------------------------------------------------------- 工作流改写
+
+/**
+ * 剔除工作流里的非节点条目。
+ *
+ * 实测：面板导出的工作流里带一个 "_api_config" 元数据节点（没有 class_type），
+ * ComfyUI 的 /prompt 会直接 400：
+ *   "Node 'ID #_api_config' has no class_type. The workflow may be corrupted..."
+ * 这类条目以 "_" 开头，是元数据不是节点，必须在提交前去掉。
+ */
+function comfy_strip_meta_nodes(array $wf): array
+{
+    foreach (array_keys($wf) as $nid) {
+        $node = $wf[$nid];
+        if (!is_array($node)) {
+            unset($wf[$nid]);
+            continue;
+        }
+        if (!isset($node['class_type']) || $node['class_type'] === '' || $node['class_type'] === null) {
+            unset($wf[$nid]);
+        }
+    }
+    return $wf;
+}
 
 /**
  * 载入工作流模板。
@@ -259,7 +347,10 @@ function comfy_load_workflow(string $name): array
         return [];
     }
     $wf = json_decode((string) $raw, true);
-    return is_array($wf) ? $wf : [];
+    if (!is_array($wf)) {
+        return [];
+    }
+    return comfy_strip_meta_nodes($wf);
 }
 
 /**

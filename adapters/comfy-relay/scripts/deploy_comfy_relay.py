@@ -38,6 +38,8 @@ FILES = [
     "scripts/poll_video.php",
     "scripts/fetch_content.php",
     "scripts/create_image.php",
+    "scripts/poll_image.php",
+    "scripts/upload_issue.php",
     "workflows/API-U17-9图1视频3音频V1-api.json",
     "workflows/API-image-sdxl.json",
 ]
@@ -75,30 +77,25 @@ def connect(host, user, pw):
     return f
 
 
+def ensure_dir(f, path):
+    """逐级 cd 进 path，每级不存在就建。注意：FTP 的 cwd 是相对当前目录的，
+    不能用 'a/b/' 这种累加路径（会重复进入同一层导致 550）。"""
+    for part in [p for p in path.split("/") if p]:
+        try:
+            f.cwd(part)
+        except Exception:
+            f.mkd(part)
+            f.cwd(part)
+
+
 def send(host, user, pw, remote, data: bytes, retries=4):
     last = ""
     for attempt in range(retries):
         try:
             f = connect(host, user, pw)
-            parts = remote.split("/")
-            cur = ""
-            for p in parts[:-1]:
-                cur += p + "/"
-                try:
-                    f.cwd(cur)
-                except Exception:
-                    try:
-                        f.mkd(cur)
-                        f.cwd(cur)
-                    except Exception as e:
-                        last = repr(e)
-                        f.quit()
-                        raise RuntimeError("mkdir %s: %s" % (cur, last))
-            try:
-                f.cwd(cur)
-            except Exception:
-                pass
-            f.storbinary("STOR " + parts[-1], io.BytesIO(data), retries=3)
+            parts = [p for p in remote.split("/") if p]
+            ensure_dir(f, "/".join(parts[:-1]))
+            f.storbinary("STOR " + parts[-1], io.BytesIO(data))
             f.quit()
             return True, "stored " + remote
         except Exception as e:  # noqa: BLE001
@@ -127,16 +124,13 @@ def main() -> int:
         f = connect(host, user, pw)
         print("pwd:", f.pwd())
         f.retrlines("LIST")
-        for d in (REMOTE_DIR, REMOTE_DIR + "/config", REMOTE_DIR + "/scripts", REMOTE_DIR + "/workflows", REMOTE_DIR + "/state"):
+        for d in (REMOTE_DIR, REMOTE_DIR + "/config", REMOTE_DIR + "/scripts",
+                  REMOTE_DIR + "/workflows", REMOTE_DIR + "/state"):
             try:
-                f.cwd(d)
-                print("OK cwd", d)
-            except Exception as e:  # noqa: BLE001
-                try:
-                    f.mkd(d)
-                    print("mkdir", d, "OK")
-                except Exception as e2:  # noqa: BLE001
-                    print("mkdir", d, "FAIL", repr(e2))
+                ensure_dir(f, d)
+                print("OK dir", d)
+            except Exception as e2:  # noqa: BLE001
+                print("FAIL dir", d, repr(e2))
         f.quit()
         return 0
 
@@ -175,6 +169,7 @@ echo "\\nbad = $bad\\n";
         order = [".htaccess", "index.php", "config/config.php", "config/comfy_core.php",
                  "scripts/create_video.php", "scripts/poll_video.php",
                  "scripts/fetch_content.php", "scripts/create_image.php",
+                 "scripts/poll_image.php", "scripts/upload_issue.php",
                  "workflows/API-U17-9图1视频3音频V1-api.json", "workflows/API-image-sdxl.json"]
         rc = 0
         for name in order:

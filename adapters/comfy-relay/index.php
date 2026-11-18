@@ -17,6 +17,15 @@
  */
 declare(strict_types=1);
 
+// 诊断模式：显示 PHP 错误（生产请关掉）
+if (getenv('COMFY_RELAY_DEBUG') === '1' || isset($_GET['__debug'])) {
+    ini_set('display_errors', '1');
+    error_reporting(E_ALL);
+} else {
+    ini_set('display_errors', '0');
+    ini_set('log_errors', '1');
+}
+
 require __DIR__ . '/config/config.php';
 require __DIR__ . '/config/comfy_core.php';
 
@@ -80,8 +89,14 @@ function relay_auth(): void
 
 // ---------------------------------------------------------------- 路由
 
+// 剥掉部署前缀（如 /comfy-relay）。用 strpos 定位第一个出现位置，
+// 避免正则非贪婪/贪婪在嵌套路径下剥错。
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
-$path = preg_replace('#^.*?/comfy-relay#', '', $path);
+$marker = '/comfy-relay';
+$pos = strpos($path, $marker);
+if ($pos !== false) {
+    $path = substr($path, $pos + strlen($marker));
+}
 $path = '/' . trim($path, '/');
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
@@ -98,6 +113,56 @@ if ($path === '/health' || $path === '/') {
     ]);
 }
 
+// --- 上游连通性诊断（用于排查 Hostinger -> 云机的出网）
+if ($path === '/diag/upstream') {
+    $t0 = microtime(true);
+    $r = comfy_request('GET', '/system_stats', null, [], ['timeout' => 25]);
+    $ms = (int) ((microtime(true) - $t0) * 1000);
+    send_json([
+        'ok' => $r['error'] === null && $r['status'] === 200,
+        'upstream' => COMFY_BASE,
+        'http_status' => $r['status'],
+        'latency_ms' => $ms,
+        'error' => $r['error'],
+        'comfyui_version' => $r['json']['system']['comfyui_version'] ?? null,
+        'server_time' => gmdate('c'),
+    ], $r['error'] === null && $r['status'] === 200 ? 200 : 502);
+}
+
+// --- 裸 POST 连通性诊断（区分 GET 通但 POST 卡）
+if ($path === '/diag/post') {
+    $t0 = microtime(true);
+    $r = comfy_request('POST', '/prompt', json_encode(['prompt' => [], 'client_id' => 'diag']), ['Content-Type' => 'application/json'], ['timeout' => 20]);
+    $ms = (int) ((microtime(true) - $t0) * 1000);
+    send_json(['ok' => $r['error'] === null, 'latency_ms' => $ms, 'status' => $r['status'], 'error' => $r['error'], 'body' => substr($r['body'], 0, 300)]);
+}
+
+// --- 上传耗时诊断
+if ($path === '/diag/upload') {
+    $t0 = microtime(true);
+    $f = $_FILES['image'] ?? null;
+    if (!$f) {
+        fail(400, '缺 image');
+    }
+    $up = comfy_upload($f['tmp_name'], 'diag_' . bin2hex(random_bytes(4)) . '.jpg', $f['type']);
+    $ms = (int) ((microtime(true) - $t0) * 1000);
+    send_json(['ok' => !empty($up['ok']), 'latency_ms' => $ms, 'result' => $up]);
+}
+
+// --- 签发上传令牌（供浏览器直传云机，文件不过中继）
+if ($path === '/v1/uploads/issue' && $method === 'POST') {
+    relay_auth();
+    require __DIR__ . '/scripts/upload_issue.php';
+    $mime = trim((string) ($_POST['mime'] ?? 'image/png'));
+    $size = (int) ($_POST['size'] ?? 0);
+    $ext = strtolower((string) ($_POST['ext'] ?? ''));
+    if (!in_array($ext, ['jpg', 'jpeg', 'png', 'webp', 'mp4', 'mov', 'mkv', 'webm', 'mp3', 'wav'], true)) {
+        $ext = 'png';
+    }
+    $cloudName = 'canvas_' . bin2hex(random_bytes(6)) . '.' . $ext;
+    send_json(upload_issue($cloudName, $mime, $size));
+}
+
 // --- 创建视频任务
 if ($path === '/v1/videos' && $method === 'POST') {
     relay_auth();
@@ -108,6 +173,9 @@ if ($path === '/v1/videos' && $method === 'POST') {
 // --- 查询视频任务
 if (preg_match('#^/v1/videos/([A-Za-z0-9_\-]+)$#', $path, $m)) {
     relay_auth();
+    // 脚本用 $argv[1] 取 task id；Web 下 $argv 不存在，这里补上
+    $argv = [$m[1]];
+    $taskId = $m[1];
     require __DIR__ . '/scripts/poll_video.php';
     exit;
 }
@@ -115,6 +183,8 @@ if (preg_match('#^/v1/videos/([A-Za-z0-9_\-]+)$#', $path, $m)) {
 // --- 下载成片
 if (preg_match('#^/v1/videos/([A-Za-z0-9_\-]+)/content$#', $path, $m)) {
     relay_auth();
+    $argv = [$m[1]];
+    $taskId = $m[1];
     require __DIR__ . '/scripts/fetch_content.php';
     exit;
 }
@@ -130,6 +200,15 @@ if ($path === '/v1/images/generations' && $method === 'POST') {
 if ($path === '/v1/images/edits' && $method === 'POST') {
     relay_auth();
     require __DIR__ . '/scripts/create_image.php';
+    exit;
+}
+
+// --- 查询生图任务
+if (preg_match('#^/v1/images/([A-Za-z0-9_\-]+)$#', $path, $m)) {
+    relay_auth();
+    $argv = [$m[1]];
+    $taskId = $m[1];
+    require __DIR__ . '/scripts/poll_image.php';
     exit;
 }
 

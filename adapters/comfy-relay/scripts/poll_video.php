@@ -7,7 +7,10 @@
  */
 declare(strict_types=1);
 
-$taskId = $argv[1] ?? ($_GET['id'] ?? '');
+// index.php 路由已注入 $taskId；这里再兜底 CLI/直接访问场景
+if (!isset($taskId) || $taskId === '') {
+    $taskId = $argv[1] ?? ($_GET['id'] ?? '');
+}
 if (!preg_match('/^[A-Za-z0-9_\-]+$/', (string) $taskId)) {
     fail(400, '非法 task id');
 }
@@ -23,7 +26,7 @@ if ($promptId === '') {
 }
 
 // ---- 向云机查历史
-$res = comfy_request('GET', '/history/' . rawurlencode($promptId), null, [], ['timeout' => 60]);
+$res = comfy_request('GET', '/history/' . rawurlencode($promptId), null, [], ['timeout' => 8, 'retries' => 3]);
 
 if ($res['error'] !== null) {
     // 云机暂时不可达：保持 queued，别把任务判死（画布会继续轮询）

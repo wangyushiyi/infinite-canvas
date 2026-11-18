@@ -16,13 +16,22 @@
     </Files>
 </IfModule>
 
-# ---- 内部状态目录不外露 ----
+# ---- 路由与内部目录保护 ----
 <IfModule mod_rewrite.c>
     RewriteEngine On
+
+    # 内部目录一律不外露（必须在下面的通用 rewrite 之前）
     RewriteRule ^state/ - [F,L]
     RewriteRule ^config/ - [F,L]
     RewriteRule ^workflows/ - [F,L]
     RewriteRule ^scripts/ - [F,L]
+
+    # 其余非静态路径统一交给 index.php 处理
+    # （Hostinger 的子目录站点必须显式 rewrite，否则 /comfy-relay/health 会走
+    #   站点的 default.php 而不是我们的 index.php）
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^(.*)$ index.php [QSA,L]
 </IfModule>
 
 # ---- 其它保护 ----

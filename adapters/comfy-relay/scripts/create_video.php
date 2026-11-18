@@ -16,6 +16,8 @@
  */
 declare(strict_types=1);
 
+require __DIR__ . '/upload_issue.php';
+
 $wf = comfy_load_workflow(COMFY_VIDEO_WORKFLOW);
 if (!$wf) {
     fail(500, '工作流模板不存在或解析失败: ' . COMFY_VIDEO_WORKFLOW);
@@ -36,54 +38,20 @@ $watermark = ($_POST['watermark'] ?? 'false') === 'true';
 $firstFrame = $_FILES['first_frame'] ?? null;
 $lastFrame = $_FILES['last_frame'] ?? null;
 
-// 全能参考模式：画布同时追加 image[] 和 images 两个字段名
-$imageFiles = [];
-foreach (['image[]', 'images', 'image'] as $field) {
-    if (!isset($_FILES[$field])) {
-        continue;
-    }
-    $f = $_FILES[$field];
-    if (is_array($f['name'] ?? null)) {
-        foreach ($f['name'] as $i => $n) {
-            $imageFiles[] = [
-                'tmp_name' => $f['tmp_name'][$i],
-                'name' => $n,
-                'error' => $f['error'][$i] ?? UPLOAD_ERR_OK,
-                'type' => $f['type'][$i] ?? 'application/octet-stream',
-            ];
-        }
-    } else {
-        $imageFiles[] = [
-            'tmp_name' => $f['tmp_name'],
-            'name' => $f['name'],
-            'error' => $f['error'] ?? UPLOAD_ERR_OK,
-            'type' => $f['type'] ?? 'application/octet-stream',
-        ];
-    }
-}
-
-$videoFile = null;
-foreach (['video[]', 'video', 'videos'] as $field) {
-    if (isset($_FILES[$field]) && is_array($_FILES[$field]['name'] ?? null)) {
-        $f = $_FILES[$field];
-        $videoFile = [
-            'tmp_name' => $f['tmp_name'],
-            'name' => $f['name'],
-            'error' => $f['error'] ?? UPLOAD_ERR_OK,
-            'type' => $f['type'] ?? 'video/mp4',
-        ];
-        break;
-    }
-}
-
-if ($prompt === '' && !$imageFiles) {
+if ($prompt === '' && !isset($_POST['upload_id'])) {
     fail(400, '需要 prompt 或至少一张参考图');
 }
-if (!$imageFiles && $mode !== 'frames') {
-    fail(400, '至少需要 1 张参考图');
-}
 
-// ---------------------------------------------------------------- 上传参考图
+// ---------------------------------------------------------------- 收集参考图 / 原视频
+
+// 优先走「浏览器直传云机」（文件不过中继，见 upload_issue.php 里的实测说明）；
+// 没有直传信息时才回退到「文件过中继」。
+$references = collect_references();
+$videoRef = collect_video();
+
+if (!$references && $mode !== 'frames') {
+    fail(400, '至少需要 1 张参考图（直传请带 upload_id + cloud_name，或用 image[] 上传）');
+}
 
 if (DRY_RUN) {
     send_json([
@@ -98,40 +66,15 @@ if (DRY_RUN) {
             'size' => $size,
             'ratio' => $ratio,
             'mode' => $mode,
-            'image_count' => count($imageFiles),
-            'has_video' => $videoFile !== null,
+            'image_count' => count($references),
+            'images' => $references,
+            'video' => $videoRef,
         ],
     ]);
 }
 
-$imageNames = [];
-foreach ($imageFiles as $idx => $f) {
-    if (($f['error'] ?? UPLOAD_ERR_OK) !== UPLOAD_ERR_OK) {
-        fail(400, '参考图上传失败（第 ' . ($idx + 1) . ' 张），错误码 ' . $f['error']);
-    }
-    $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', (string) $f['name']);
-    $ext = strtolower(pathinfo($safe, PATHINFO_EXTENSION)) ?: 'png';
-    $cloudName = 'canvas_ref' . ($idx + 1) . '_' . bin2hex(random_bytes(4)) . '.' . $ext;
-    $up = comfy_upload($f['tmp_name'], $cloudName, $f['type']);
-    if (!$up['ok']) {
-        fail(502, '参考图上传到云机失败: ' . $up['error']);
-    }
-    $imageNames[] = $up['name'];
-}
-
-// ---------------------------------------------------------------- 上传原视频
-
-$videoName = '';
-if ($videoFile !== null && ($videoFile['error'] ?? UPLOAD_ERR_OK) === UPLOAD_ERR_OK) {
-    $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', (string) $videoFile['name']);
-    $ext = strtolower(pathinfo($safe, PATHINFO_EXTENSION)) ?: 'mp4';
-    $cloudName = 'canvas_src_' . bin2hex(random_bytes(4)) . '.' . $ext;
-    $up = comfy_upload($videoFile['tmp_name'], $cloudName, $videoFile['type']);
-    if (!$up['ok']) {
-        fail(502, '原视频上传到云机失败: ' . $up['error']);
-    }
-    $videoName = $up['name'];
-}
+$imageNames = array_map(static fn($r) => $r['name'], $references);
+$videoName = $videoRef !== null ? $videoRef['name'] : '';
 
 // ---------------------------------------------------------------- 编排工作流
 
@@ -167,13 +110,22 @@ $body = json_encode([
     'client_id' => 'comfy-relay-' . bin2hex(random_bytes(4)),
 ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
-$res = comfy_request('POST', '/prompt', $body, ['Content-Type' => 'application/json'], ['timeout' => 180]);
+$res = comfy_request('POST', '/prompt', $body, ['Content-Type' => 'application/json'], ['timeout' => 12, 'retries' => 3]);
 if ($res['error'] !== null) {
     fail(502, '提交云机工作流失败: ' . $res['error']);
 }
 if ($res['status'] !== 200 || !is_array($res['json']) || empty($res['json']['prompt_id'])) {
-    $errs = $res['json']['node_errors'] ?? $res['body'];
-    fail(502, '云机未接受工作流（HTTP ' . $res['status'] . '）: ' . substr(json_encode($errs, JSON_UNESCAPED_UNICODE) ?: $res['body'], 0, 800));
+    // ComfyUI 的错误可能在 node_errors，也可能在顶层 error.message
+    // （实测：'_api_config' 无 class_type 这种错误 node_errors 是空的，错误在 error.message）
+    $errs = $res['json']['node_errors'] ?? null;
+    if (empty($errs)) {
+        $errs = $res['json']['error'] ?? null;
+    }
+    if (empty($errs)) {
+        $errs = $res['body'];
+    }
+    $msg = is_string($errs) ? $errs : (json_encode($errs, JSON_UNESCAPED_UNICODE) ?: $res['body']);
+    fail(502, '云机未接受工作流（HTTP ' . $res['status'] . '）: ' . substr($msg, 0, 800));
 }
 
 $promptId = (string) $res['json']['prompt_id'];
