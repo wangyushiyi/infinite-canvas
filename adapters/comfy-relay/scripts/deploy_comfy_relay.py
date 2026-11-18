@@ -28,12 +28,13 @@ REMOTE_DIR = "comfy-relay"
 # 本脚本在 adapters/comfy-relay/scripts/ 下，往上两层才是服务根目录
 LOCAL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 需要上传的文件（相对 REMOTE_DIR）
+# 需要上传的固定文件（相对 REMOTE_DIR）
 FILES = [
     ".htaccess",
     "index.php",
     "config/config.php",
     "config/comfy_core.php",
+    "config/video_profiles.php",
     "scripts/create_video.php",
     "scripts/poll_video.php",
     "scripts/fetch_content.php",
@@ -43,6 +44,21 @@ FILES = [
     "workflows/API-U17-9图1视频3音频V1-api.json",
     "workflows/API-image-sdxl.json",
 ]
+
+
+def workflow_files() -> list:
+    """workflows/ 目录下所有 .json（U 系工作流按 ASCII 名存放，动态扫描避免漏传）。"""
+    wf_dir = os.path.join(LOCAL_DIR, "workflows")
+    if not os.path.isdir(wf_dir):
+        return []
+    return [
+        "workflows/" + fn
+        for fn in sorted(os.listdir(wf_dir))
+        if fn.endswith(".json")
+    ]
+
+# workflows/ 下的所有 JSON 都要同步（U 系工作流由 analyze_u_slots.py 批量生成）
+WILDCARD_WORKFLOWS = True
 
 # config/config.php 含真实密钥，**不入 Git**（见 .gitignore）。
 # 部署时优先用本地真实配置；本地没有就退回仓库里的模板（部署后必须手工改）。
@@ -89,17 +105,40 @@ def ensure_dir(f, path):
 
 
 def send(host, user, pw, remote, data: bytes, retries=4):
+    """
+    上传一个文件。
+
+    注意：这台 FTP 服务器在 STOR 之前会先建一个 `.in.<name>` 临时文件，
+    再改名成目标文件。如果上一次 STOR 中途断了（网络抖动），`.in.<name>`
+    会残留下来，下次重试就会撞 550 "Temporary hidden file already exists"。
+    -> 每次重试前先把残留的临时文件和目标文件删掉。
+    """
     last = ""
+    parts = [p for p in remote.split("/") if p]
+    dirc = "/".join(parts[:-1])
+    fname = parts[-1]
     for attempt in range(retries):
+        f = None
         try:
             f = connect(host, user, pw)
-            parts = [p for p in remote.split("/") if p]
-            ensure_dir(f, "/".join(parts[:-1]))
-            f.storbinary("STOR " + parts[-1], io.BytesIO(data))
+            ensure_dir(f, dirc)
+            # 服务器的临时文件是 `.in.<name>.`（**末尾带一个点**），
+            # 少写那个点会 550 No such file，删不掉就永远传不上去。
+            for tmp in (".in." + fname + ".", ".in." + fname, fname):
+                try:
+                    f.delete(tmp)
+                except Exception:
+                    pass
+            f.storbinary("STOR " + fname, io.BytesIO(data))
             f.quit()
             return True, "stored " + remote
         except Exception as e:  # noqa: BLE001
             last = repr(e)
+            try:
+                if f is not None:
+                    f.close()
+            except Exception:
+                pass
             time.sleep(1.5)
     return False, last
 
@@ -136,7 +175,7 @@ def main() -> int:
 
     if step == "lint":
         payload = {}
-        for name in FILES:
+        for name in FILES + workflow_files():
             if not name.endswith(".php"):
                 continue
             path = resolve_local(name)
@@ -166,11 +205,10 @@ echo "\\nbad = $bad\\n";
 
     if step == "upload":
         # .htaccess first so config.php is protected the moment it lands
-        order = [".htaccess", "index.php", "config/config.php", "config/comfy_core.php",
-                 "scripts/create_video.php", "scripts/poll_video.php",
-                 "scripts/fetch_content.php", "scripts/create_image.php",
-                 "scripts/poll_image.php", "scripts/upload_issue.php",
-                 "workflows/API-U17-9图1视频3音频V1-api.json", "workflows/API-image-sdxl.json"]
+        order = []
+        for name in FILES + workflow_files():
+            if name not in order:
+                order.append(name)
         rc = 0
         for name in order:
             path = resolve_local(name)

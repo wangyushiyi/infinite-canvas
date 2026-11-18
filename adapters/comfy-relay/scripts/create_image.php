@@ -163,7 +163,7 @@ $body = json_encode([
     'client_id' => 'comfy-relay-img-' . bin2hex(random_bytes(4)),
 ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
-$res = comfy_request('POST', '/prompt', $body, ['Content-Type' => 'application/json'], ['timeout' => 12, 'retries' => 3]);
+$res = comfy_request('POST', '/prompt', $body, ['Content-Type' => 'application/json'], ['timeout' => 6, 'retries' => 1]);
 if ($res['error'] !== null) {
     fail(502, '提交云机工作流失败: ' . $res['error']);
 }

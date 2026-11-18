@@ -110,6 +110,23 @@ if ($path === '/health' || $path === '/') {
         'workflow' => COMFY_VIDEO_WORKFLOW,
         'php' => PHP_VERSION,
         'time' => gmdate('c'),
+        // 可用视频模型清单：画布侧照着填「模型名」即可切换 U 系
+        'video_models' => array_values(array_filter(
+            array_map(
+                static fn($name, $p) => [
+                    'model' => $name,
+                    'label' => (string) ($p['label'] ?? ''),
+                    'workflow' => (string) ($p['file'] ?? ''),
+                    'mode' => (string) ($p['mode'] ?? 'slots'),
+                    'supports_video' => (bool) ($p['supports_video'] ?? false),
+                    'defaults' => $p['defaults'] ?? [],
+                ],
+                array_keys(comfy_video_profiles()),
+                array_values(comfy_video_profiles())
+            ),
+            static fn($item) => true
+        )),
+        'video_models_total' => count(comfy_video_profiles()),
     ]);
 }
 
@@ -161,6 +178,34 @@ if ($path === '/v1/uploads/issue' && $method === 'POST') {
     }
     $cloudName = 'canvas_' . bin2hex(random_bytes(6)) . '.' . $ext;
     send_json(upload_issue($cloudName, $mime, $size));
+}
+
+// --- 云机自助注册（换机器后云机自己上报新地址）
+
+// --- 模型列表（OpenAI 标准格式）
+// 画布的「拉取模型列表」按钮打的就是这个端点（GET {base}/models）。
+// 返回的 id 里带 "video" 是有意的：画布用 guessCapability() 按名字推断能力，
+// VIDEO_KEYWORDS = ["video","sora","veo","kling","wan","hailuo"]，
+// 命中 "video" 才会被自动标成「视频」能力，省得一个个手动指定。
+if ($path === '/v1/models' && $method === 'GET') {
+    relay_auth();
+    $items = [];
+    foreach (comfy_video_profiles() as $name => $p) {
+        if (!empty($p['hidden'])) {
+            continue;   // 兼容别名：可用，但不出现在列表里
+        }
+        $items[] = [
+            'id' => $name,
+            'object' => 'model',
+            'created' => 0,
+            'owned_by' => 'comfy-relay',
+            // 非标准字段：给渠道编辑器看的信息（画布会忽略多余字段）
+            'capability' => 'video',
+            'label' => (string) ($p['label'] ?? ''),
+        ];
+    }
+    send_json(['object' => 'list', 'data' => $items]);
+    exit;
 }
 
 // --- 创建视频任务

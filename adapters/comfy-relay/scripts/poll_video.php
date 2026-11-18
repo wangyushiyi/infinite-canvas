@@ -26,7 +26,7 @@ if ($promptId === '') {
 }
 
 // ---- 向云机查历史
-$res = comfy_request('GET', '/history/' . rawurlencode($promptId), null, [], ['timeout' => 8, 'retries' => 3]);
+$res = comfy_request('GET', '/history/' . rawurlencode($promptId), null, [], ['timeout' => 5, 'retries' => 1]);
 
 if ($res['error'] !== null) {
     // 云机暂时不可达：保持 queued，别把任务判死（画布会继续轮询）

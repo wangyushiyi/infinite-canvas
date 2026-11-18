@@ -33,6 +33,308 @@ PASS = 0
 FAIL = 0
 
 
+def test_profiles_patch(profiles):
+    print("\n[17] 档案驱动的改写行为")
+    img_names = ["a.png", "b.png"]
+    vid_name = "src.mp4"
+    pj = '{"summary":"x"}'
+
+    for name, p in profiles.items():
+        wf = load_wf(p["file"])
+        out = patch_dispatch(wf, img_names, vid_name, pj, 7.0, 12345, 8, "16:9", 0.9, p)
+        slots = p.get("slots") or {}
+
+        # 参考图：用了的写对、没用清空
+        imgs = slots.get("images") or {}
+        ok_used = all(out[nid]["inputs"]["image"] == img_names[int(i)]
+                      for i, nid in imgs.items() if int(i) < len(img_names))
+        ok_blank = all(out[nid]["inputs"]["image"] == ""
+                       for i, nid in imgs.items() if int(i) >= len(img_names))
+        check("%s 参考图按槽位写入" % name, ok_used)
+        check("%s 未用图槽已清空（不会读到模板示例图）" % name, ok_blank)
+
+        # prompt
+        ps = slots.get("prompt")
+        if p["mode"] == "pickref":
+            check("%s prompt 已写入 Pick 节点" % name,
+                  out[slots["pick"]]["inputs"].get("prompt") == pj)
+            # media_files 只有模板里存在时才需要清空（有的 pickref 模板没这个键）
+            check("%s media_files 已清空" % name,
+                  out[slots["pick"]]["inputs"].get("media_files", "[]") == "[]",
+                  "键是否存在: %s" % ("media_files" in out[slots["pick"]]["inputs"]))
+            check("%s 独立音频槽已清空" % name,
+                  all(out[slots["pick"]]["inputs"].get("ref_audio_%d" % i) == "" for i in range(3)))
+            check("%s 音轨锁定接 Pick[12]" % name,
+                  out[slots["h3"]]["inputs"].get("ref_video_audios.ref_video_audio_0") == [slots["pick"], 12])
+            check("%s 独立音频槽已从 H3 断开" % name,
+                  not any(k.startswith("ref_audios.") for k in out[slots["h3"]]["inputs"]))
+        else:
+            if isinstance(ps, list) and len(ps) == 2:
+                check("%s prompt 已写入节点 %s" % (name, ps[0]),
+                      out[ps[0]]["inputs"].get(ps[1]) == pj)
+            check("%s 时长已写入" % name,
+                  abs(float(out[slots["duration"]]["inputs"]["value"]) - 7.0) < 1e-6)
+            if slots.get("seed"):
+                check("%s seed 已写入" % name,
+                      out[slots["seed"]]["inputs"].get("noise_seed") == 12345)
+            if slots.get("aspect"):
+                check("%s 比例已写入且合法" % name,
+                      out[slots["aspect"]]["inputs"].get("aspect_ratio") in VALID_ASPECTS)
+            # 音轨直连原视频 AUDIO 出口
+            h3 = out[slots["h3"]]["inputs"]
+            aud_slots = [k for k in h3 if k.startswith("ref_audios.") or k.startswith("ref_video_audios.")]
+            if aud_slots:
+                check("%s 音轨直连原视频 AUDIO 出口" % name,
+                      all(h3[k] == [str((slots.get("videos") or {}).get("0", SLOT_VIDEO)), 2] for k in aud_slots))
+
+    # 无视频时：视频/音频槽必须断开（否则会引用云机上不存在的文件）
+    broken = []
+    for name, p in profiles.items():
+        wf = load_wf(p["file"])
+        out = patch_dispatch(wf, img_names, "", pj, 7.0, 1, 8, "16:9", 0.9, p)
+        slots = p.get("slots") or {}
+        h3 = out[slots["h3"]]["inputs"]
+        for k in h3:
+            if k.startswith("ref_videos.") or k.startswith("ref_audios.") or k.startswith("ref_video_audios."):
+                broken.append("%s:%s" % (name, k))
+    check("无原视频时视频/音频槽全部断开", not broken, "; ".join(broken[:6]))
+
+    # 未知模型回落到 U17
+    check("未知模型回落到默认档案",
+          load_profiles_php().get("minimax-h3-video-u17") is not None)
+
+
+def test_profile_workflow_pairing(profiles):
+    print("\n[18] 档案与工作流的配对一致性")
+    # U17 的槽位必须与 PHP 里原有的硬编码常量一致（防止自动反推跑偏）
+    p = profiles.get("minimax-h3-u17")
+    if p:
+        slots = p.get("slots") or {}
+        check("U17 图槽与原硬编码常量一致",
+              [slots.get("images", {})[str(i)] for i in range(9)] == H3_SLOT_IMAGES,
+              str([slots.get("images", {}).get(str(i)) for i in range(9)]))
+        check("U17 H3 节点一致", slots.get("h3") == SLOT_H3, str(slots.get("h3")))
+        check("U17 视频节点一致", (slots.get("videos") or {}).get("0") == SLOT_VIDEO)
+        check("U17 prompt 节点一致", slots.get("prompt") == [SLOT_PROMPT, "value"], str(slots.get("prompt")))
+        check("U17 时长节点一致", slots.get("duration") == SLOT_SECONDS)
+        check("U17 分辨率节点一致", slots.get("aspect") == SLOT_ASPECT)
+        check("U17 seed 节点一致", slots.get("seed") == SLOT_SEED)
+
+    # 每个工作流文件里都能找到对应的主节点
+    miss = []
+    for name, p in profiles.items():
+        wf = load_wf(p["file"])
+        if p["mode"] == "pickref":
+            if not any(n.get("class_type") == "ZealmanH3PickReferenceMedia" for n in wf.values()):
+                miss.append(name + "(无统一入口)")
+        else:
+            if not any("H3" in (n.get("class_type") or "") for n in wf.values()):
+                miss.append(name + "(无 H3 节点)")
+    check("每个工作流都含预期的主节点", not miss, "; ".join(miss[:6]))
+
+    # 覆盖度
+    check("可用模型数 >= 12", len(profiles) >= 12, "共 %d 个" % len(profiles))
+    picks = [n for n, p in profiles.items() if p["mode"] == "pickref"]
+    slots_m = [n for n, p in profiles.items() if p["mode"] == "slots"]
+    check("两种模式都有覆盖", len(picks) >= 3 and len(slots_m) >= 5,
+          "pickref=%d slots=%d" % (len(picks), len(slots_m)))
+
+
+def patch_slots(wf, image_names, video_name, prompt_json, seconds, seed, steps, aspect, megapixels, profile):
+    """profile 驱动的 slots 型改写复刻。"""
+    slots = profile.get("slots") or {}
+    h3_id = str(slots.get("h3") or SLOT_H3)
+
+    img_map = slots.get("images") or {}
+    if not img_map:
+        img_map = {str(i): nid for i, nid in enumerate(H3_SLOT_IMAGES)}
+    for idx, nid in img_map.items():
+        if nid in wf:
+            wf[nid]["inputs"]["image"] = image_names[int(idx)] if int(idx) < len(image_names) else ""
+
+    vid_map = slots.get("videos") or {}
+    if not vid_map and SLOT_VIDEO in wf:
+        vid_map = {"0": SLOT_VIDEO}
+    for idx, nid in vid_map.items():
+        if nid in wf:
+            wf[nid]["inputs"]["video"] = video_name if int(idx) == 0 else ""
+
+    ps = slots.get("prompt")
+    if isinstance(ps, list) and len(ps) == 2 and ps[0] in wf and ps[1] in wf[ps[0]]["inputs"]:
+        wf[ps[0]]["inputs"][ps[1]] = prompt_json
+    elif SLOT_PROMPT in wf:
+        wf[SLOT_PROMPT]["inputs"]["value"] = prompt_json
+
+    dur = str(slots.get("duration") or SLOT_SECONDS)
+    if dur in wf and "value" in wf[dur]["inputs"]:
+        wf[dur]["inputs"]["value"] = max(1.0, seconds)
+    asp = str(slots.get("aspect") or SLOT_ASPECT)
+    if asp in wf:
+        wf[asp]["inputs"]["aspect_ratio"] = h3_aspect(aspect)
+        wf[asp]["inputs"]["megapixels"] = megapixels if megapixels > 0 else 0.9
+    sd = str(slots.get("seed") or SLOT_SEED)
+    if sd in wf:
+        wf[sd]["inputs"]["noise_seed"] = seed
+    if SLOT_STEPS in wf:
+        wf[SLOT_STEPS]["inputs"]["value"] = max(1, steps)
+
+    if h3_id in wf:
+        h3 = wf[h3_id]["inputs"]
+        if video_name:
+            vid_node = str(vid_map.get("0") or SLOT_VIDEO)
+            for k in list(h3.keys()):
+                if k.startswith("ref_audios.") or k.startswith("ref_video_audios."):
+                    h3[k] = [vid_node, 2]
+        else:
+            for k in list(h3.keys()):
+                if k.startswith("ref_videos.") or k.startswith("ref_audios.") or k.startswith("ref_video_audios."):
+                    del h3[k]
+    return wf
+
+
+def patch_pickref(wf, image_names, video_name, prompt_json, seconds, seed, steps, aspect, megapixels, profile):
+    """comfy_patch_pickref_workflow 的 Python 复刻。"""
+    slots = profile.get("slots") or {}
+    pick_id = str(slots.get("pick") or "")
+    h3_id = str(slots.get("h3") or "")
+    if pick_id not in wf:
+        raise ValueError("统一入口节点缺失: " + pick_id)
+    ins = wf[pick_id]["inputs"]
+
+    for i in range(9):
+        k = "ref_image_%d" % i
+        if k in ins:
+            ins[k] = image_names[i] if i < len(image_names) else ""
+    for i in range(3):
+        k = "ref_video_%d" % i
+        if k in ins:
+            ins[k] = video_name if i == 0 else ""
+    for i in range(3):
+        k = "ref_audio_%d" % i
+        if k in ins:
+            ins[k] = ""
+    if "media_files" in ins:
+        ins["media_files"] = "[]"
+
+    if "prompt" in ins:
+        ins["prompt"] = prompt_json
+    if "seconds" in ins:
+        ins["seconds"] = max(1.0, seconds)
+    if "aspect_ratio" in ins:
+        ins["aspect_ratio"] = h3_aspect(aspect)
+    if "megapixels" in ins:
+        ins["megapixels"] = megapixels if megapixels > 0 else 0.9
+
+    if slots.get("seed") and slots["seed"] in wf:
+        wf[slots["seed"]]["inputs"]["noise_seed"] = seed
+
+    if h3_id and h3_id in wf:
+        h3 = wf[h3_id]["inputs"]
+        if video_name:
+            h3["ref_video_audios.ref_video_audio_0"] = [pick_id, 12]
+            for k in list(h3.keys()):
+                if k.startswith("ref_audios."):
+                    del h3[k]
+        else:
+            for k in list(h3.keys()):
+                if k.startswith("ref_videos.") or k.startswith("ref_audios.") or k.startswith("ref_video_audios."):
+                    del h3[k]
+    return wf
+
+
+def patch_dispatch(wf, image_names, video_name, prompt_json, seconds, seed, steps, aspect, megapixels, profile):
+    if profile.get("mode") == "pickref":
+        return patch_pickref(wf, image_names, video_name, prompt_json, seconds, seed, steps, aspect, megapixels, profile)
+    return patch_slots(wf, image_names, video_name, prompt_json, seconds, seed, steps, aspect, megapixels, profile)
+
+
+VALID_ASPECTS = {
+    "1:1 (Square)", "2:3 (Portrait Photo)", "3:2 (Photo)", "3:4 (Portrait Standard)",
+    "4:3 (Standard)", "9:16 (Portrait Widescreen)", "16:9 (Widescreen)", "21:9 (Ultrawide)",
+}
+
+
+def parse_php_array(src):
+    """解析 PHP 数组字面量（=> 风格），返回 Python 结构。"""
+    state = {"i": 0}
+
+    def skip_ws():
+        while state["i"] < len(src) and src[state["i"]] in " \t\r\n":
+            state["i"] += 1
+
+    def parse_value():
+        skip_ws()
+        i = state["i"]
+        if src.startswith("true", i):
+            state["i"] = i + 4
+            return True
+        if src.startswith("false", i):
+            state["i"] = i + 5
+            return False
+        if src.startswith("null", i):
+            state["i"] = i + 4
+            return None
+        if src[i] == "'":
+            j = i + 1
+            buf = []
+            while j < len(src):
+                if src[j] == "\\":
+                    buf.append(src[j + 1])
+                    j += 2
+                    continue
+                if src[j] == "'":
+                    break
+                buf.append(src[j])
+                j += 1
+            state["i"] = j + 1
+            return "".join(buf)
+        if src[i] == "[":
+            state["i"] = i + 1
+            items = []
+            while True:
+                skip_ws()
+                if state["i"] >= len(src):
+                    break
+                if src[state["i"]] == "]":
+                    state["i"] += 1
+                    break
+                first = parse_value()
+                skip_ws()
+                if src.startswith("=>", state["i"]):
+                    state["i"] += 2
+                    val = parse_value()
+                    items.append((first, val))
+                else:
+                    items.append((None, first))
+                skip_ws()
+                if state["i"] < len(src) and src[state["i"]] == ",":
+                    state["i"] += 1
+            if items and all(k is not None for k, _ in items):
+                return dict(items)
+            return [v for _, v in items]
+        j = i
+        while j < len(src) and (src[j].isdigit() or src[j] in ".-+eE"):
+            j += 1
+        if j > i:
+            txt = src[i:j]
+            state["i"] = j
+            try:
+                return int(txt)
+            except ValueError:
+                return float(txt)
+        raise ValueError("无法解析: " + src[state["i"]:state["i"] + 40])
+
+    return parse_value()
+
+
+def load_wf(name):
+    path = os.path.join(WF_DIR, name + ".json")
+    data = json.load(io.open(path, encoding="utf-8"))
+    if isinstance(data.get("prompt"), dict):
+        return data["prompt"]
+    return data
+
+
 def check(name, cond, extra=""):
     global PASS, FAIL
     if cond:
@@ -407,7 +709,17 @@ def test_retry_and_timeout():
     check("5xx/429 会重试", "$last['status'] >= 500 || $last['status'] === 429" in core)
     check("有退避 sleep", "sleep(1 << ($attempt - 1))" in core)
     cv = io.open(os.path.join(ROOT, "scripts", "create_video.php"), encoding="utf-8").read()
-    check("提交超时控制在 PHP 上限内", "'timeout' => 12" in cv)
+    # 超时预算：单次 timeout × (retries+1) + 退避 sleep，必须远小于 PHP 上限(30s)
+    budget_fail = []
+    for rel in ["scripts/create_video.php", "scripts/poll_video.php",
+                "scripts/create_image.php", "scripts/poll_image.php"]:
+        src = io.open(os.path.join(ROOT, rel), encoding="utf-8").read()
+        for m in re.finditer(r"'timeout'\s*=>\s*(\d+)\s*,\s*'retries'\s*=>\s*(\d+)", src):
+            t, r = int(m.group(1)), int(m.group(2))
+            total = t * (r + 1) + (2 ** r - 1)
+            if total >= 25:
+                budget_fail.append("%s: %ds x %d retries = %ds" % (rel, t, r, total))
+    check("超时预算均 < 25s（PHP 上限 30s）", not budget_fail, str(budget_fail))
     check("body 类型不是 array 约束", "?array $body = null" not in core)
 
 
@@ -439,6 +751,119 @@ def test_route_param_passing():
               "preg_match('/^[A-Za-z0-9_\\-]+$/', (string) $taskId)" in src)
 
 
+def test_comment_balance():
+    print("\n[15] PHP 注释块闭合（防 /** 被截断成 *）")
+    for rel in ["index.php", "config/config.php", "config/comfy_core.php",
+                "scripts/create_video.php", "scripts/poll_video.php",
+                "scripts/fetch_content.php", "scripts/create_image.php",
+                "scripts/poll_image.php", "scripts/upload_issue.php"]:
+        src = io.open(os.path.join(ROOT, rel), encoding="utf-8").read()
+        opens = src.count("/*")
+        closes = src.count("*/")
+        check("%s 注释块配平" % rel, opens == closes, "/*=%d */=%d" % (opens, closes))
+        # 逐行找「不在注释块内却以 * 开头」的行（典型症状：/** 被截断）
+        inblock = False
+        bad = []
+        for i, line in enumerate(src.split("\n"), 1):
+            st = line.strip()
+            if inblock:
+                if "*/" in st:
+                    inblock = False
+                continue
+            if st.startswith("/*"):
+                if "*/" not in st:
+                    inblock = True
+                continue
+            if st.startswith("*"):
+                bad.append(i)
+        check("%s 无游离的 * 行" % rel, not bad, "行 %s" % bad[:5])
+
+
+def load_profiles_php():
+    """读取 config/video_profiles.php 里的档案表。"""
+    path = os.path.join(ROOT, "config", "video_profiles.php")
+    src = io.open(path, encoding="utf-8").read()
+    start = src.index("return [")
+    end = src.index("\n    ];", start)
+    return parse_php_array(src[start + len("return "):end + 1])
+
+
+def test_profiles_table():
+    print("\n[16] 多 U 系档案表（config/video_profiles.php）")
+    profiles = load_profiles_php()
+    check("档案表可解析且非空", isinstance(profiles, dict) and len(profiles) >= 10, "共 %d 个" % len(profiles))
+    check("每个档案都有 file/mode/label/defaults",
+          all(all(k in p for k in ("file", "mode", "label", "defaults")) for p in profiles.values()))
+    check("mode 只有 pickref / slots 两种",
+          all(p["mode"] in ("pickref", "slots") for p in profiles.values()),
+          str(sorted({p["mode"] for p in profiles.values()})))
+
+    # 工作流文件都在
+    missing = [p["file"] for p in profiles.values()
+               if not os.path.isfile(os.path.join(WF_DIR, p["file"] + ".json"))]
+    check("档案引用的工作流文件全部存在", not missing, "缺失: %s" % missing)
+
+    # 槽位节点号在工作流里真实存在
+    bad = []
+    for name, p in profiles.items():
+        wf = load_wf(p["file"])
+        slots = p.get("slots") or {}
+        for key in ("h3", "pick"):
+            if slots.get(key) and slots[key] not in wf:
+                bad.append("%s.%s=%s" % (name, key, slots[key]))
+        for grp in ("images", "audios", "videos"):
+            for idx, nid in (slots.get(grp) or {}).items():
+                if nid not in wf:
+                    bad.append("%s.%s[%s]=%s" % (name, grp, idx, nid))
+        for key in ("duration", "seed", "aspect"):
+            if slots.get(key) and slots[key] not in wf:
+                bad.append("%s.%s=%s" % (name, key, slots[key]))
+        ps = slots.get("prompt")
+        if isinstance(ps, list) and ps[0] not in wf:
+            bad.append("%s.prompt=%s" % (name, ps[0]))
+    check("档案里的所有槽位节点号在工作流中真实存在", not bad, "; ".join(bad[:6]))
+
+    # 槽位语义正确
+    sem = []
+    for name, p in profiles.items():
+        wf = load_wf(p["file"])
+        slots = p.get("slots") or {}
+        for idx, nid in (slots.get("images") or {}).items():
+            if wf[nid].get("class_type") != "LoadImage":
+                sem.append("%s 图槽%s -> %s(%s)" % (name, idx, nid, wf[nid].get("class_type")))
+            elif "image" not in (wf[nid].get("inputs") or {}):
+                sem.append("%s 图槽%s 节点无 image 输入" % (name, idx))
+        for idx, nid in (slots.get("audios") or {}).items():
+            ct = wf[nid].get("class_type", "")
+            if not ("Audio" in ct or "LoadAudio" in ct):
+                sem.append("%s 音槽%s -> %s" % (name, idx, ct))
+        for idx, nid in (slots.get("videos") or {}).items():
+            if "LoadVideo" not in wf[nid].get("class_type", ""):
+                sem.append("%s 视槽%s -> %s" % (name, idx, wf[nid].get("class_type")))
+        ps = slots.get("prompt")
+        if isinstance(ps, list) and len(ps) == 2:
+            if ps[1] not in (wf[ps[0]].get("inputs") or {}):
+                sem.append("%s prompt 节点无 %s 输入" % (name, ps[1]))
+        if slots.get("duration") and wf[slots["duration"]].get("class_type") != "PrimitiveFloat":
+            sem.append("%s duration 不是 PrimitiveFloat" % name)
+        if slots.get("seed") and "noise_seed" not in (wf[slots["seed"]].get("inputs") or {}):
+            sem.append("%s seed 节点无 noise_seed" % name)
+        if slots.get("pick") and wf[slots["pick"]].get("class_type") != "ZealmanH3PickReferenceMedia":
+            sem.append("%s pick 节点类型不对" % name)
+    check("槽位语义正确（LoadImage/音频/视频/prompt/duration/seed）", not sem, "; ".join(sem[:6]))
+
+    # 档案默认值合法
+    bad_def = []
+    for name, p in profiles.items():
+        d = p.get("defaults") or {}
+        if not (0 < float(d.get("seconds", 0)) <= 150):
+            bad_def.append("%s seconds=%s" % (name, d.get("seconds")))
+        if h3_aspect(str(d.get("aspect", ""))) not in VALID_ASPECTS:
+            bad_def.append("%s aspect=%s" % (name, d.get("aspect")))
+    check("档案默认秒数/比例合法", not bad_def, "; ".join(bad_def[:6]))
+    return profiles
+
+
 if __name__ == "__main__":
     test_prompt()
     test_aspect()
@@ -453,6 +878,10 @@ if __name__ == "__main__":
     test_upload_flow()
     test_retry_and_timeout()
     test_route_param_passing()
+    test_comment_balance()
+    _profiles = test_profiles_table()
+    test_profiles_patch(_profiles)
+    test_profile_workflow_pairing(_profiles)
     print("\n" + "=" * 56)
     print("PASS=%d  FAIL=%d" % (PASS, FAIL))
     print("=" * 56)

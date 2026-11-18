@@ -27,9 +27,24 @@
 | 协议 | **OpenAI** |
 | 接口地址 | `https://slategrey-vulture-564350.hostingersite.com/comfy-relay/v1` |
 | API Key | `config/config.php` 里的 `RELAY_KEY` |
-| 模型名 | `minimax-h3-ref2va`（视频） / `sdxl`（图片） |
-| 模型能力 | 视频 / 图片 |
+| 模型名 | 点「拉取模型列表」自动获取 16 个 U 系 / `sdxl`（图片） |
+| 模型能力 | 视频 / 图片（拉取时按名字自动判定） |
 | 调用脚本 | **留空** ✅ |
+
+### 多 U 系（2026-11-18 新增）
+
+**画布里选模型名 = 选工作流**，不用挂脚本、不用改 PHP：
+
+| 模型名 | 对应 |
+|---|---|
+| `minimax-h3-video-u17` ~ `minimax-h3-video-u32`（16 个） | U 系 16 个工作流 |
+| `minimax-h3-ref2va` | 旧名别名（= U17），仍可用 |
+
+拉取模型列表的中继端点：`GET /comfy-relay/v1/models`。
+完整说明见 **[多U系使用指南.md](多U系使用指南.md)**。
+
+档案表 `config/video_profiles.php` 由 `comfy_adapter/analyze_u_slots.py`
+（自动反推槽位）+ `comfy_adapter/gen_video_profiles.py`（翻译成 PHP）生成，**勿手改**。
 
 > 接口地址以 `/v1` 结尾时画布不会重复补 `/v1`（`buildApiUrl` 会识别已有版本号路径）。
 

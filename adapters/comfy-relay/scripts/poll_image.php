@@ -27,7 +27,7 @@ if ($promptId === '') {
     fail(500, '任务记录损坏，缺少 prompt_id');
 }
 
-$res = comfy_request('GET', '/history/' . rawurlencode($promptId), null, [], ['timeout' => 8, 'retries' => 3]);
+$res = comfy_request('GET', '/history/' . rawurlencode($promptId), null, [], ['timeout' => 5, 'retries' => 1]);
 
 if ($res['error'] !== null) {
     send_json([
@@ -95,7 +95,7 @@ state_put($taskId, array_merge($rec, [
 
 // 取回图片，转成 dataURL（画布接受 dataURL）
 $q = http_build_query(['filename' => $filename, 'subfolder' => $subfolder, 'type' => 'output']);
-$img = comfy_request('GET', '/view?' . $q, null, [], ['timeout' => 20, 'retries' => 2]);
+$img = comfy_request('GET', '/view?' . $q, null, [], ['timeout' => 8, 'retries' => 1]);
 if ($img['status'] !== 200 || $img['body'] === '') {
     send_json([
         'id' => $taskId,

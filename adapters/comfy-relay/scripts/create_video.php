@@ -18,21 +18,39 @@ declare(strict_types=1);
 
 require __DIR__ . '/upload_issue.php';
 
-$wf = comfy_load_workflow(COMFY_VIDEO_WORKFLOW);
+// ---------------------------------------------------------------- 选档（模型名 -> 工作流）
+
+$model = trim((string) ($_POST['model'] ?? ''));
+$profile = comfy_video_profile($model);
+$wfName = (string) ($profile['file'] ?? COMFY_VIDEO_WORKFLOW);
+
+$wf = comfy_load_workflow($wfName);
 if (!$wf) {
-    fail(500, '工作流模板不存在或解析失败: ' . COMFY_VIDEO_WORKFLOW);
+    fail(500, '工作流模板不存在或解析失败: ' . $wfName . '（模型 ' . $model . '）');
 }
 
 // ---------------------------------------------------------------- 解析字段
 
-$model = trim((string) ($_POST['model'] ?? ''));
 $prompt = trim((string) ($_POST['prompt'] ?? ''));
-$seconds = (float) ($_POST['seconds'] ?? 5);
-$size = trim((string) ($_POST['size'] ?? ''));
-$ratio = trim((string) ($_POST['ratio'] ?? ''));
 $mode = trim((string) ($_POST['mode'] ?? 'reference'));
 $generateAudio = ($_POST['generate_audio'] ?? 'true') === 'true';
 $watermark = ($_POST['watermark'] ?? 'false') === 'true';
+
+// 规格优先级：**档案默认优先**，画布只在显式改了的时候才覆盖。
+//   - 秒数：画布内置默认是 6（normalizeVideoSeconds 的默认值），
+//           传 6 视为"未设置" -> 用档案默认；传别的值 -> 用画布的。
+//   - 宽高比 / 百万像素：属于 U 系自身的规格（u22v1 就是 9:16 竖屏），
+//           一律用档案默认，不接受画布覆盖，避免选错比例跑出废片。
+$defaults = $profile['defaults'] ?? [];
+$rawSeconds = (float) ($_POST['seconds'] ?? 0);
+if ($rawSeconds > 0 && abs($rawSeconds - 6.0) > 0.01) {
+    $seconds = $rawSeconds;                       // 用户在画布里显式改了时长
+} else {
+    $seconds = (float) ($defaults['seconds'] ?? 5.0);
+}
+$aspect = (string) ($defaults['aspect'] ?? '16:9');
+$megapixels = (float) ($defaults['megapixels'] ?? 0.9);
+$steps = (int) ($defaults['steps'] ?? 8);
 
 // 首尾帧模式：画布用 first_frame / last_frame
 $firstFrame = $_FILES['first_frame'] ?? null;
@@ -70,6 +88,18 @@ if (DRY_RUN) {
             'images' => $references,
             'video' => $videoRef,
         ],
+        'profile' => [
+            'model' => $model,
+            'label' => (string) ($profile['label'] ?? ''),
+            'workflow' => $wfName,
+            'patch_mode' => (string) ($profile['mode'] ?? 'slots'),
+            'spec' => [
+                'seconds' => $seconds,
+                'aspect' => $aspect,
+                'megapixels' => $megapixels,
+                'steps' => $steps,
+            ],
+        ],
     ]);
 }
 
@@ -80,17 +110,6 @@ $videoName = $videoRef !== null ? $videoRef['name'] : '';
 
 $promptJson = h3_build_prompt($prompt, max(1, count($imageNames)), $mode);
 
-// size 形如 "480x640"；取宽高比交给 ResolutionSelector
-$aspect = $size !== '' && preg_match('/^\d+x\d+$/', $size) ? $size : $ratio;
-if ($aspect === '') {
-    $aspect = '16:9';
-}
-
-// 分辨率 -> megapixels 近似（画布 vquality: 480/720/1080）
-$resName = trim((string) ($_POST['resolution_name'] ?? '720p'));
-$resNum = (int) preg_replace('/[^0-9]/', '', $resName) ?: 720;
-$megapixels = $resNum <= 480 ? 0.5 : ($resNum <= 720 ? 0.9 : 1.4);
-
 $patched = comfy_patch_workflow(
     $wf,
     $imageNames,
@@ -98,9 +117,10 @@ $patched = comfy_patch_workflow(
     $promptJson,
     $seconds,
     random_int(1, 2147483647),   // 固定 seed 会命中 ComfyUI 缓存出一样的片
-    8,
+    $steps,
     $aspect,
-    $megapixels
+    $megapixels,
+    $profile
 );
 
 // ---------------------------------------------------------------- 提交
@@ -110,7 +130,10 @@ $body = json_encode([
     'client_id' => 'comfy-relay-' . bin2hex(random_bytes(4)),
 ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
-$res = comfy_request('POST', '/prompt', $body, ['Content-Type' => 'application/json'], ['timeout' => 12, 'retries' => 3]);
+// ⚠️ 超时预算必须 < Hostinger 的 PHP 执行上限（约 30s）：
+//    单次 timeout × (retries+1) + 退避 sleep 必须留出余量。
+//    12s × 4 = 48s 会撞上限 -> 请求被掐断成 HTTP 000（看不出原因）。
+$res = comfy_request('POST', '/prompt', $body, ['Content-Type' => 'application/json'], ['timeout' => 6, 'retries' => 1]);
 if ($res['error'] !== null) {
     fail(502, '提交云机工作流失败: ' . $res['error']);
 }
@@ -138,8 +161,14 @@ state_put($taskId, [
     'subfolder' => '',
     'type' => 'output',
     'model' => $model,
+    'profile' => (string) ($profile['label'] ?? $wfName),
+    'workflow' => $wfName,
+    'patch_mode' => (string) ($profile['mode'] ?? 'slots'),
     'prompt' => $prompt,
     'seconds' => $seconds,
+    'aspect' => $aspect,
+    'megapixels' => $megapixels,
+    'steps' => $steps,
     'image_count' => count($imageNames),
     'has_video' => $videoName !== '',
     'generate_audio' => $generateAudio,
@@ -155,4 +184,10 @@ send_json([
     'status' => 'queued',
     'created_at' => time(),
     'prompt_id' => $promptId,
+    'profile' => [
+        'label' => (string) ($profile['label'] ?? ''),
+        'workflow' => $wfName,
+        'patch_mode' => (string) ($profile['mode'] ?? 'slots'),
+        'spec' => ['seconds' => $seconds, 'aspect' => $aspect, 'megapixels' => $megapixels, 'steps' => $steps],
+    ],
 ]);

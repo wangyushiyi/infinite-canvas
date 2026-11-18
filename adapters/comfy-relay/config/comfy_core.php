@@ -22,6 +22,8 @@
  * 5) ComfyUI 固定 seed 会命中缓存出一样的片 → 每次随机 seed。
  */
 
+require __DIR__ . '/video_profiles.php';
+
 const H3_SLOT_IMAGES = ['248', '249', '247', '246', '279', '280', '281', '282', '283'];
 const SLOT_VIDEO = '256';
 const SLOT_PROMPT = '250';
@@ -366,7 +368,7 @@ function comfy_load_workflow(string $name): array
  * @param string $aspect
  * @param float $megapixels
  */
-function comfy_patch_workflow(
+function comfy_patch_pickref_workflow(
     array $wf,
     array $imageNames,
     string $videoName,
@@ -375,57 +377,87 @@ function comfy_patch_workflow(
     int $seed,
     int $steps,
     string $aspect,
-    float $megapixels
+    float $megapixels,
+    array $profile
 ): array {
-    // 1) 参考图 -> LoadImage 节点（按 H3 槽位真序，不按节点号升序）
-    foreach (H3_SLOT_IMAGES as $i => $nid) {
-        if (!isset($wf[$nid])) {
+    $slots = $profile['slots'] ?? [];
+    $pickId = (string) ($slots['pick'] ?? '');
+    $h3Id = (string) ($slots['h3'] ?? '');
+    if ($pickId === '' || !isset($wf[$pickId])) {
+        fail(500, '统一入口节点缺失（pick=' . $pickId . '）');
+    }
+
+    $ins = &$wf[$pickId]['inputs'];
+
+    // 1) 参考图：填入的写真名，未用的槽显式清空（否则会读到模板自带的示例图）
+    for ($i = 0; $i < 9; $i++) {
+        $k = 'ref_image_' . $i;
+        if (!array_key_exists($k, $ins)) {
             continue;
         }
-        $name = $imageNames[$i] ?? ($imageNames ? end($imageNames) : null);
-        if ($name !== null && $name !== '') {
-            $wf[$nid]['inputs']['image'] = $name;
+        $ins[$k] = (string) ($imageNames[$i] ?? '');
+    }
+    // 2) 参考视频：只有槽 0 用真实文件，其余清空
+    for ($i = 0; $i < 3; $i++) {
+        $k = 'ref_video_' . $i;
+        if (!array_key_exists($k, $ins)) {
+            continue;
         }
+        $ins[$k] = ($i === 0) ? $videoName : '';
+    }
+    // 3) 独立音频：统一入口型不接独立音频（音轨走视频音轨槽），全部清空
+    for ($i = 0; $i < 3; $i++) {
+        $k = 'ref_audio_' . $i;
+        if (!array_key_exists($k, $ins)) {
+            continue;
+        }
+        $ins[$k] = '';
+    }
+    // media_files 是聚合入口，必须清空，否则会与 ref_* 槽重复
+    if (array_key_exists('media_files', $ins)) {
+        $ins['media_files'] = '[]';
     }
 
-    // 2) 原视频 -> VHS_LoadVideo
-    if ($videoName !== '' && isset($wf[SLOT_VIDEO])) {
-        $wf[SLOT_VIDEO]['inputs']['video'] = $videoName;
+    // 4) 文本与规格
+    if (array_key_exists('prompt', $ins)) {
+        $ins['prompt'] = $promptJson;
+    }
+    if (array_key_exists('seconds', $ins)) {
+        $ins['seconds'] = max(1.0, $seconds);
+    }
+    if (array_key_exists('aspect_ratio', $ins)) {
+        $ins['aspect_ratio'] = h3_aspect($aspect);
+    }
+    if (array_key_exists('megapixels', $ins)) {
+        $ins['megapixels'] = $megapixels > 0 ? $megapixels : 0.9;
+    }
+    unset($ins);
+
+    // 5) seed
+    if (!empty($slots['seed']) && isset($wf[$slots['seed']]['inputs'])) {
+        $wf[$slots['seed']]['inputs']['noise_seed'] = $seed;
     }
 
-    // 3) prompt
-    if (isset($wf[SLOT_PROMPT])) {
-        $wf[SLOT_PROMPT]['inputs']['value'] = $promptJson;
-    }
-
-    // 4) 时长 / 分辨率 / seed / steps
-    if (isset($wf[SLOT_SECONDS])) {
-        $wf[SLOT_SECONDS]['inputs']['value'] = max(1.0, $seconds);
-    }
-    if (isset($wf[SLOT_ASPECT])) {
-        $wf[SLOT_ASPECT]['inputs']['aspect_ratio'] = h3_aspect($aspect);
-        $wf[SLOT_ASPECT]['inputs']['megapixels'] = $megapixels > 0 ? $megapixels : 0.9;
-    }
-    if (isset($wf[SLOT_SEED])) {
-        $wf[SLOT_SEED]['inputs']['noise_seed'] = $seed;
-    }
-    if (isset($wf[SLOT_STEPS])) {
-        $wf[SLOT_STEPS]['inputs']['value'] = max(1, $steps);
-    }
-
-    // 5) 音轨一致性：ref_audios 直连原视频 AUDIO 出口
-    if (isset($wf[SLOT_H3])) {
-        $h3 = &$wf[SLOT_H3];
+    // 6) H3 侧音轨接线
+    if ($h3Id !== '' && isset($wf[$h3Id])) {
+        $h3 = &$wf[$h3Id];
         if ($videoName !== '') {
+            // ★ 音轨锁定：接原视频自带音轨（Pick 的 12 号输出）
+            $h3['inputs']['ref_video_audios.ref_video_audio_0'] = [$pickId, 12];
+            // 独立音频槽断开（否则模型会拿音色参考重新念一遍）
             foreach (array_keys($h3['inputs']) as $key) {
                 if (str_starts_with($key, 'ref_audios.')) {
-                    $h3['inputs'][$key] = [SLOT_VIDEO, 2];   // VHS_LoadVideo -> AUDIO
+                    unset($h3['inputs'][$key]);
                 }
             }
         } else {
-            // 没有原视频 -> 纯参考图生视频，断开视频/音频槽位
+            // 没有原视频 -> 视频/音频槽全部断开。
+            // 断开后 Pick 的对应输出没有下游，H3 拿不到空视频参考，
+            // 同时 LoadAudio 链不会执行（也就不会引用云机上不存在的音频文件）。
             foreach (array_keys($h3['inputs']) as $key) {
-                if (str_starts_with($key, 'ref_videos.') || str_starts_with($key, 'ref_audios.')) {
+                if (str_starts_with($key, 'ref_videos.')
+                    || str_starts_with($key, 'ref_audios.')
+                    || str_starts_with($key, 'ref_video_audios.')) {
                     unset($h3['inputs'][$key]);
                 }
             }
@@ -436,7 +468,28 @@ function comfy_patch_workflow(
     return $wf;
 }
 
-// ---------------------------------------------------------------- 任务账本
+/**
+ * 按档案改写工作流。
+ *
+ * profile['mode']:
+ *   pickref -> 统一入口型（见 comfy_patch_pickref_workflow）
+ *   slots   -> 真序接线型：LoadImage / LoadAudio / VHS_LoadVideo 直接喂 H3 的 ref_* 槽
+ *
+ * profile['slots'] 给出每个工作流自己的槽位节点号（由 analyze_u_slots.py 自动反推）。
+ * 缺省时回落到 U17 的硬编码常量（保持向后兼容）。
+ *
+ * @param array $wf
+ * @param array $imageNames
+ * @param string $videoName
+ * @param string $promptJson
+ * @param float $seconds
+ * @param int $seed
+ * @param int $steps
+ * @param string $aspect
+ * @param float $megapixels
+ * @param array $profile
+ * @return array
+ */
 
 function state_dir(): string
 {
@@ -502,3 +555,115 @@ function state_prune(int $maxAgeSeconds = 86400): void
     }
     state_save($st);
 }
+function comfy_patch_workflow(
+    array $wf,
+    array $imageNames,
+    string $videoName,
+    string $promptJson,
+    float $seconds,
+    int $seed,
+    int $steps,
+    string $aspect,
+    float $megapixels,
+    array $profile = []
+): array {
+    $mode = (string) ($profile['mode'] ?? 'slots');
+    if ($mode === 'pickref') {
+        return comfy_patch_pickref_workflow(
+            $wf,
+            $imageNames,
+            $videoName,
+            $promptJson,
+            $seconds,
+            $seed,
+            $steps,
+            $aspect,
+            $megapixels,
+            $profile
+        );
+    }
+
+    $slots = $profile['slots'] ?? [];
+    $h3Id = (string) ($slots['h3'] ?? SLOT_H3);
+
+    // 1) 参考图 -> LoadImage 节点（槽位顺序由档案给出，不按节点号升序）
+    $imgMap = $slots['images'] ?? [];
+    if (!$imgMap) {
+        foreach (H3_SLOT_IMAGES as $i => $nid) {
+            $imgMap[(string) $i] = $nid;
+        }
+    }
+    foreach ($imgMap as $idx => $nid) {
+        if (!isset($wf[$nid])) {
+            continue;
+        }
+        $wf[$nid]['inputs']['image'] = (string) ($imageNames[(int) $idx] ?? '');
+    }
+
+    // 2) 原视频 -> VHS_LoadVideo（只有槽 0 用真实文件）
+    $vidMap = $slots['videos'] ?? [];
+    if (!$vidMap && isset($wf[SLOT_VIDEO])) {
+        $vidMap = ['0' => SLOT_VIDEO];
+    }
+    foreach ($vidMap as $idx => $nid) {
+        if (!isset($wf[$nid])) {
+            continue;
+        }
+        $wf[$nid]['inputs']['video'] = ((int) $idx === 0) ? $videoName : '';
+    }
+
+    // 3) prompt
+    $promptSlot = $slots['prompt'] ?? null;
+    if (is_array($promptSlot) && isset($wf[$promptSlot[0]]['inputs'][$promptSlot[1]])) {
+        $wf[$promptSlot[0]]['inputs'][$promptSlot[1]] = $promptJson;
+    } elseif (isset($wf[SLOT_PROMPT]['inputs']['value'])) {
+        $wf[SLOT_PROMPT]['inputs']['value'] = $promptJson;
+    }
+
+    // 4) 时长 / 分辨率 / seed / steps
+    $durNode = (string) ($slots['duration'] ?? SLOT_SECONDS);
+    if (isset($wf[$durNode]['inputs']['value'])) {
+        $wf[$durNode]['inputs']['value'] = max(1.0, $seconds);
+    }
+    $aspNode = (string) ($slots['aspect'] ?? SLOT_ASPECT);
+    if (isset($wf[$aspNode]['inputs'])) {
+        $wf[$aspNode]['inputs']['aspect_ratio'] = h3_aspect($aspect);
+        $wf[$aspNode]['inputs']['megapixels'] = $megapixels > 0 ? $megapixels : 0.9;
+    }
+    $seedNode = (string) ($slots['seed'] ?? SLOT_SEED);
+    if (isset($wf[$seedNode]['inputs'])) {
+        $wf[$seedNode]['inputs']['noise_seed'] = $seed;
+    }
+    if (isset($wf[SLOT_STEPS]['inputs']['value'])) {
+        $wf[SLOT_STEPS]['inputs']['value'] = max(1, $steps);
+    }
+
+    // 5) 音轨一致性：把 ref_audios.* 直连原视频的 AUDIO 出口（VHS_LoadVideo 的 index 2），
+    //    旁路掉工作流自带的 LoadAudio->TrimAudioDuration 链。
+    //    没有原视频时断开视频/音频槽 -> 对应加载节点变成孤儿节点不会执行，
+    //    也就不会因为引用了云机上不存在的音频文件而报错。
+    if (isset($wf[$h3Id])) {
+        $h3 = &$wf[$h3Id];
+        if ($videoName !== '') {
+            $vidNode = (string) ($vidMap['0'] ?? SLOT_VIDEO);
+            foreach (array_keys($h3['inputs']) as $key) {
+                if (str_starts_with($key, 'ref_audios.') || str_starts_with($key, 'ref_video_audios.')) {
+                    $h3['inputs'][$key] = [$vidNode, 2];   // VHS_LoadVideo -> AUDIO
+                }
+            }
+        } else {
+            foreach (array_keys($h3['inputs']) as $key) {
+                if (str_starts_with($key, 'ref_videos.')
+                    || str_starts_with($key, 'ref_audios.')
+                    || str_starts_with($key, 'ref_video_audios.')) {
+                    unset($h3['inputs'][$key]);
+                }
+            }
+        }
+        unset($h3);
+    }
+
+    return $wf;
+}
+
+// ---------------------------------------------------------------- 任务账本
