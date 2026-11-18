@@ -152,6 +152,37 @@ python scripts/deploy_comfy_relay.py verify   # 验证
 > - `COMFY_BASE`（云机地址，**AutoDL 换机后会变**）
 > - `PUBLIC_BASE`（对外基地址）
 
+### 换云机怎么办（AutoDL 实例是按小时计费的临时机）
+
+**画布侧一个字都不用改** —— 画布填的是中继地址（固定），只有中继要知道云机的新地址。
+
+AutoDL 公网入口格式：`https://u1002042-<实例ID>.<区域>.seetacloud.com:8443`
+（实例ID 随机器变；区域是 `bjb1` / `bjb2` / `westd` 等）
+
+换机后三步：
+
+```bash
+# 1) AutoDL 控制台：确认新实例已开机，并开自定义服务映射 8443 -> 容器 6006
+# 2) 改中继的云机地址（改 config.php + 重新部署 + 注册 + 探活，一条命令）
+python scripts/switch_cloud.py --base https://u1002042-<新实例ID>.bjb2.seetacloud.com:8443
+# 3) 验证
+python scripts/switch_cloud.py --status
+```
+
+> `switch_cloud.py` 属于「按需手动」的工具，不在 Git 里（本地保留即可）。
+> 它做四件事：改 config.php → 重新部署 → 调用 `/admin/register-cloud` 注册 → 探活并打印结果。
+
+**探活失败时中继不会切换**（保持旧地址，画布不至于全挂）。网关返回码有明确含义：
+
+| 返回 | 含义 |
+|---|---|
+| 404 | 实例ID 或区域不对 |
+| 307 | 实例在，但**端口映射没开**（控制台要开 8443 → 6006） |
+| 0 | 连不上（实例没开机，或映射未开） |
+
+**画布侧也不需要改**：`config.php` 的 `COMFY_BASE` 只是兜底，
+实际生效地址由中继的动态注册机制接管（`state/cloud.json`）。
+
 ---
 
 ## 干跑探针

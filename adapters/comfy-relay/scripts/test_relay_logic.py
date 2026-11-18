@@ -708,6 +708,19 @@ def test_upload_flow():
     check("create_video 引入 upload_issue", "require __DIR__ . '/upload_issue.php'" in cv)
     check("create_video 用 collect_references", "collect_references()" in cv)
     check("create_video 用 collect_video", "collect_video()" in cv)
+    # 换机工具（手动，不依赖任何自动注册机制）
+    sw_p = os.path.join(ROOT, "scripts", "switch_cloud.py")
+    check("switch_cloud.py 存在", os.path.isfile(sw_p))
+    if os.path.isfile(sw_p):
+        sw = io.open(sw_p, encoding="utf-8").read()
+        check("switch_cloud 不依赖已回退的注册端点", "/admin/register-cloud" not in sw)
+        check("switch_cloud 改 COMFY_BASE", "COMFY_BASE" in sw)
+        check("switch_cloud 先探活再改", "probe(base)" in sw and "未切换" in sw)
+        check("switch_cloud 能解释 404", "网关 404" in sw)
+        check("switch_cloud 能解释 307", "网关 307" in sw)
+        check("switch_cloud 有 --force", "--force" in sw)
+        check("switch_cloud 能重新部署", "deploy_config" in sw)
+        check("switch_cloud 有 --status", "--status" in sw)
 
 
 def test_retry_and_timeout():
