@@ -491,70 +491,6 @@ function comfy_patch_pickref_workflow(
  * @return array
  */
 
-function state_dir(): string
-{
-    if (!is_dir(STATE_DIR)) {
-        @mkdir(STATE_DIR, 0775, true);
-    }
-    return STATE_DIR;
-}
-
-function state_file(): string
-{
-    return state_dir() . '/tasks.json';
-}
-
-/**
- * 读取任务账本。task_id => [prompt_id, status, filename, subfolder, created_at, meta]
- */
-function state_load(): array
-{
-    $f = state_file();
-    if (!is_file($f)) {
-        return [];
-    }
-    $raw = @file_get_contents($f);
-    if ($raw === false || $raw === '') {
-        return [];
-    }
-    $j = json_decode((string) $raw, true);
-    return is_array($j) ? $j : [];
-}
-
-function state_save(array $st): void
-{
-    $f = state_file();
-    @file_put_contents($f, json_encode($st, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT), LOCK_EX);
-}
-
-/** 写一条任务记录。 */
-function state_put(string $taskId, array $rec): void
-{
-    $st = state_load();
-    $rec['updated_at'] = time();
-    $st[$taskId] = $rec;
-    state_save($st);
-}
-
-function state_get(string $taskId): ?array
-{
-    $st = state_load();
-    return $st[$taskId] ?? null;
-}
-
-/** 清理超过 N 小时的旧记录。 */
-function state_prune(int $maxAgeSeconds = 86400): void
-{
-    $st = state_load();
-    $now = time();
-    foreach ($st as $k => $v) {
-        $ts = (int) ($v['updated_at'] ?? $v['created_at'] ?? 0);
-        if ($ts > 0 && $now - $ts > $maxAgeSeconds) {
-            unset($st[$k]);
-        }
-    }
-    state_save($st);
-}
 function comfy_patch_workflow(
     array $wf,
     array $imageNames,
@@ -667,3 +603,69 @@ function comfy_patch_workflow(
 }
 
 // ---------------------------------------------------------------- 任务账本
+
+
+function state_dir(): string
+{
+    if (!is_dir(STATE_DIR)) {
+        @mkdir(STATE_DIR, 0775, true);
+    }
+    return STATE_DIR;
+}
+
+function state_file(): string
+{
+    return state_dir() . '/tasks.json';
+}
+
+/**
+ * 读取任务账本。task_id => [prompt_id, status, filename, subfolder, created_at, meta]
+ */
+function state_load(): array
+{
+    $f = state_file();
+    if (!is_file($f)) {
+        return [];
+    }
+    $raw = @file_get_contents($f);
+    if ($raw === false || $raw === '') {
+        return [];
+    }
+    $j = json_decode((string) $raw, true);
+    return is_array($j) ? $j : [];
+}
+
+function state_save(array $st): void
+{
+    $f = state_file();
+    @file_put_contents($f, json_encode($st, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT), LOCK_EX);
+}
+
+/** 写一条任务记录。 */
+function state_put(string $taskId, array $rec): void
+{
+    $st = state_load();
+    $rec['updated_at'] = time();
+    $st[$taskId] = $rec;
+    state_save($st);
+}
+
+function state_get(string $taskId): ?array
+{
+    $st = state_load();
+    return $st[$taskId] ?? null;
+}
+
+/** 清理超过 N 小时的旧记录。 */
+function state_prune(int $maxAgeSeconds = 86400): void
+{
+    $st = state_load();
+    $now = time();
+    foreach ($st as $k => $v) {
+        $ts = (int) ($v['updated_at'] ?? $v['created_at'] ?? 0);
+        if ($ts > 0 && $now - $ts > $maxAgeSeconds) {
+            unset($st[$k]);
+        }
+    }
+    state_save($st);
+}
